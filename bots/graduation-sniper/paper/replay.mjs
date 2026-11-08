@@ -9,6 +9,14 @@ export function replayFixture(session, fixture) {
       results.push({ atMs: event.atMs, type: "trade", result: session.trySignal(event, event.atMs) });
       continue;
     }
+    if (event.type === "pool") {
+      const result = session.observePool(event.mint, event.view, event.atMs);
+      if (result.reason === "no_position" || result.reason === "not_pending") {
+        throw new Error(`fixture pool for ${event.mint} is not pending at ${event.atMs}`);
+      }
+      results.push({ atMs: event.atMs, type: "pool", result });
+      continue;
+    }
     if (event.type === "curve") {
       const result = session.observe(event.mint, event.state, event.atMs);
       if (result.reason === "no_position") {

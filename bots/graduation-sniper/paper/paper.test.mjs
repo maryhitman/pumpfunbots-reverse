@@ -8,7 +8,20 @@ import { PublicKey } from "@solana/web3.js";
 import { BUY_INSTRUCTIONS, PUMP_PROGRAM, TRADE_EVENT_PREFIX } from "../../../lib/constants.mjs";
 import { quoteBuy, quoteSell, spotRatioProceedsLamports } from "./curve.mjs";
 import { PAPER_ASSUMPTIONS, PUMP_PROGRAM_ID, STRATEGY_DEFAULTS, solToLamports } from "./defaults.mjs";
-import { assertLedgerConserved, createPaperSession } from "./engine.mjs";
+import { assertLedgerConserved, createComparison, createPaperSession, virtualSolFillPct } from "./engine.mjs";
+import {
+  FEE_CONFIG_DISC,
+  GLOBAL_CONFIG_DISC,
+  POOL_DISC,
+  PUMP_AMM_PROGRAM_ID,
+  PUMP_FEE_PROGRAM_ID,
+  TOKEN_PROGRAM_ID,
+  WSOL_MINT,
+  assessPoolAccounts,
+  canonicalPoolAddress,
+  feeCeil,
+  sellBaseQuote,
+} from "./pumpswap-quote.mjs";
 import { evaluateInvocation, PUBLIC_ENDPOINTS } from "./guard.mjs";
 import { decodeTradeEvent, parsePumpLogValue } from "./parse-log.mjs";
 import { READ_ONLY_HTTP_METHODS, READ_ONLY_WS_METHODS, bondingCurveAddress, decodeBondingCurveAccount } from "./public-read.mjs";
@@ -79,7 +92,7 @@ test("paper sources have no wallet, sign, or send path", () => {
     /new\s+Connection\b/,
     /secretKey/,
   ];
-  const web3Files = new Set(["parse-log.mjs", "public-read.mjs"]);
+  const web3Files = new Set(["parse-log.mjs", "public-read.mjs", "pumpswap-quote.mjs"]);
   for (const file of productionSources()) {
     for (const pattern of bannedCalls) {
       assert.equal(pattern.test(file.src), false, `${file.name} matched ${pattern}`);
@@ -198,8 +211,8 @@ test("faithful and improved ledgers diverge on curve exits without inventing a s
   assert.equal(timeout.snapshot().active.length, 0);
 
   const tp = createPaperSession();
-  tp.trySignal({ mint: "P", ...reserves() }, 0);
-  const took = tp.observe("P", { complete: false, virtualSolReserves: 117_300_000_000n, virtualTokenReserves: VTOK }, 10_000);
+  tp.trySignal({ mint: "P", virtualSolReserves: VSOL, virtualTokenReserves: 1_500_000_000_000_000n }, 0);
+  const took = tp.observe("P", { complete: false, virtualSolReserves: VSOL, virtualTokenReserves: VTOK }, 10_000);
   assert.equal(took.reason, "take_profit");
   assert.equal(took.modelMark.faithful.pnl.sol, "0.050000000");
   assert.notEqual(took.modelMark.improved.pnl.lamports, took.modelMark.faithful.pnl.lamports);
@@ -214,10 +227,10 @@ test("faithful and improved ledgers diverge on curve exits without inventing a s
   assert.ok(BigInt(stopped.modelMark.improved.pnl.lamports) < BigInt(stopped.modelMark.faithful.pnl.lamports));
 
   const priority = createPaperSession();
-  priority.trySignal({ mint: "both", ...reserves() }, 0);
+  priority.trySignal({ mint: "both", virtualSolReserves: VSOL, virtualTokenReserves: 1_500_000_000_000_000n }, 0);
   const both = priority.observe("both", {
     complete: false,
-    virtualSolReserves: 117_300_000_000n,
+    virtualSolReserves: VSOL,
     virtualTokenReserves: VTOK,
   }, 400_000);
   assert.equal(both.reason, "take_profit");
@@ -320,7 +333,9 @@ test("the entrypoint refuses live flags, key material, and non-public RPCs", () 
     evaluateInvocation(["node", "run.mjs", "--public-readonly", "--rpc-http", "https://mainnet.helius-rpc.com/?api-key=abc", "--rpc-ws", "wss://mainnet.helius-rpc.com"], {}).message,
     /allowlist/,
   );
-  assert.equal(evaluateInvocation(["node", "run.mjs", "--public-readonly", "--duration-sec", "331"], {}).ok, false);
+  assert.equal(evaluateInvocation(["node", "run.mjs", "--public-readonly", "--duration-sec", "661"], {}).ok, false);
+  assert.equal(evaluateInvocation(["node", "run.mjs", "--public-readonly", "--duration-sec", "600"], {}).ok, true);
+  assert.equal(evaluateInvocation(["node", "run.mjs", "--compare", "--strategy", "original", "--fixture", "x"], {}).ok, false);
   assert.equal(evaluateInvocation(["node", "run.mjs"], {}).ok, false);
   const ok = evaluateInvocation(["node", "run.mjs", "--public-readonly"], { HELIUS_API_KEY: "ignored", GRAD_BUY_SOL: "5" });
   assert.equal(ok.ok, true);
@@ -382,4 +397,177 @@ test("fixture command stays paper-only and ignores strategy overrides", () => {
   const keyed = spawnPaper(["--fixture", path.join(paperDir, "fixtures", "mixed-outcome.json")], { PRIVATE_KEY: "not-a-real-key" });
   assert.equal(keyed.status, 2);
   assert.match(keyed.stderr, /PRIVATE_KEY/);
+});
+
+const FILL_97 = 82_450_000_000n;
+
+test("97% and PumpSwap books share entries and do not invent a missed fill", () => {
+  assert.equal(virtualSolFillPct(FILL_97), 97);
+  assert.equal(virtualSolFillPct(VSOL), 92);
+  assert.doesNotMatch(fs.readFileSync(path.join(paperDir, "..", "graduation.mjs"), "utf8"), /earlyExit|pumpswap-immediate/);
+
+  const modified = createPaperSession();
+  assert.equal(modified.trySignal({ mint: "high", ...reserves(FILL_97) }, 0).reason, "at_or_above_exit_threshold");
+
+  const books = createComparison();
+  assert.equal(books.pre.config.strategy, "exit-at-97");
+  assert.equal(books.pre.config.exactOriginal, false);
+  assert.equal(books.post.config.strategy, "pumpswap-immediate");
+  assert.equal(books.pre.snapshot().startingBalance.sol, "10.000000000");
+  assert.equal(books.post.snapshot().startingBalance.sol, "10.000000000");
+
+  const opened = books.trySignal({ mint: "same", ...reserves() }, 0);
+  assert.equal(opened.pre.accepted, true);
+  assert.equal(opened.post.accepted, true);
+
+  const crossed = books.observe("same", { complete: false, ...reserves(FILL_97), slot: 10 }, 1_000);
+  assert.equal(crossed.pre.reason, "early_exit");
+  assert.equal(crossed.pre.modelMark.backfilledToThreshold, false);
+  assert.equal(crossed.pre.modelMark.observedFillPct, 97);
+  assert.equal(crossed.pre.modelMark.onChainSell, false);
+  assert.notEqual(crossed.pre.modelMark.faithful.pnl.lamports, crossed.pre.modelMark.improved.pnl.lamports);
+  assert.equal(crossed.post.reason, "hold");
+  const past = createComparison();
+  past.trySignal({ mint: "past", ...reserves() }, 0);
+  const overFill = past.observe("past", { complete: false, virtualSolReserves: 85_000_000_000n, virtualTokenReserves: VTOK, slot: 3 }, 1_000);
+  assert.equal(overFill.pre.reason, "hold");
+  assert.equal(past.pre.snapshot().ledgers.improved.modelMarkPnl.sol, "0.000000000");
+  assert.equal(books.post.snapshot().ledgers.improved.modelMarkPnl.sol, "0.000000000");
+
+  const jumped = createComparison();
+  jumped.trySignal({ mint: "gap", ...reserves() }, 0);
+  const overshot = jumped.observe("gap", {
+    complete: true,
+    virtualSolReserves: VSOL * 5n,
+    virtualTokenReserves: VTOK,
+    slot: 20,
+  }, 2_000);
+  assert.equal(overshot.pre.reason, "unpriceable");
+  assert.equal(overshot.pre.missedEarlyExit, true);
+  assert.equal(overshot.pre.modelMark, null);
+  assert.equal(jumped.pre.snapshot().ledgers.faithful.modelMarkPnl.sol, "0.000000000");
+  assert.equal(jumped.pre.snapshot().ledgers.faithful.cash.sol, "9.900000000");
+  assert.equal(overshot.post.reason, "pending_pool");
+  assert.equal(overshot.post.modelPnlBooked, false);
+  assert.equal(jumped.observePool("gap", { status: "executable", validated: true, slot: 19, userQuoteLamports: 200_000_000n }, 3_000).poolStatus, "stale_or_lookahead");
+  assert.equal(jumped.post.snapshot().ledgers.improved.modelMarkPnl.sol, "0.000000000");
+  const unread = jumped.observePool("gap", { status: "missing_pool", validated: false, slot: 21 }, 4_000);
+  assert.equal(unread.reason, "pending_pool");
+  assert.equal(unread.modelMark, null);
+  const sold = jumped.observePool("gap", {
+    status: "executable",
+    validated: true,
+    slot: 21,
+    userQuoteLamports: 90_000_000n,
+    lpFeeLamports: 1n,
+    protocolFeeLamports: 1n,
+    creatorFeeLamports: 1n,
+    formula: "pump-swap-sdk-2.2.0 sellBaseInput",
+  }, 5_000);
+  assert.equal(sold.reason, "pumpswap_immediate_exit");
+  assert.equal(sold.modelMark.spotFormulaUsed, false);
+  assert.equal(sold.modelMark.improved.pnl.lamports, "-10000000");
+  assert.equal(sold.onChainSell, false);
+  assert.equal(jumped.pre.snapshot().stats.pumpswapExits, 0);
+  assert.equal(jumped.observePool("gap", { status: "executable", validated: true, slot: 5, userQuoteLamports: 1n }, 6_000).reason, "no_position");
+
+  const timed = createComparison();
+  timed.trySignal({ mint: "slow", ...reserves() }, 0);
+  timed.observe("slow", { complete: true, ...reserves(), slot: 4 }, 1_000);
+  const missed = timed.observePool("slow", { status: "rate_limited", validated: false, slot: 4 }, 301_000);
+  assert.equal(missed.reason, "missed_exit");
+  assert.equal(missed.modelPnlBooked, false);
+  assert.equal(timed.post.snapshot().ledgers.improved.cash.sol, "9.900000000");
+  assert.equal(timed.post.snapshot().active[0].slotLocked, true);
+
+  const raw = (50_000n * 100n) / 1_100n;
+  const quoted = sellBaseQuote({
+    baseIn: 100n,
+    baseReserve: 1_000n,
+    quoteReserve: 50_000n,
+    lpFeeBps: 20n,
+    protocolFeeBps: 5n,
+    creatorFeeBps: 5n,
+    coinCreatorIsDefault: false,
+  });
+  assert.equal(quoted.quoteOut, raw);
+  assert.equal(quoted.lpFee, feeCeil(raw, 20n));
+  assert.equal(quoted.userQuote, raw - feeCeil(raw, 20n) - feeCeil(raw, 5n) - feeCeil(raw, 5n));
+  assert.equal(sellBaseQuote({ baseIn: 1n, baseReserve: 0n, quoteReserve: 1n, lpFeeBps: 1n, protocolFeeBps: 1n, creatorFeeBps: 1n, coinCreatorIsDefault: true }), null);
+
+  const mint = new PublicKey("7LSsEoJGhLeZzGvDofTdNg7M3JttxQqGWNLo6vWMpump");
+  const derived = canonicalPoolAddress(mint.toBase58());
+  const baseVault = new PublicKey("5jMpkf4JF4noHftLgNKyPNh6roVfPSGSjuEk3U4eLKRa").toBase58();
+  const quoteVault = new PublicKey("43DVcZR4kQFjh4Xm2i3DcneRxNjZp7HMud8yDrJWrDr8").toBase58();
+  const poolData = Buffer.alloc(8 + 1 + 2 + 32 * 6 + 8 + 32);
+  POOL_DISC.copy(poolData, 0);
+  poolData[8] = derived.bump;
+  poolData.writeUInt16LE(0, 9);
+  let cursor = 11;
+  for (const key of [derived.authority, mint.toBase58(), WSOL_MINT, mint.toBase58(), baseVault, quoteVault]) {
+    new PublicKey(key).toBuffer().copy(poolData, cursor);
+    cursor += 32;
+  }
+  poolData.writeBigUInt64LE(1n, cursor);
+  cursor += 8;
+  new PublicKey(derived.authority).toBuffer().copy(poolData, cursor);
+  const vault = (which, amount) => {
+    const data = Buffer.alloc(165);
+    new PublicKey(which === "base" ? mint : WSOL_MINT).toBuffer().copy(data, 0);
+    new PublicKey(derived.address).toBuffer().copy(data, 32);
+    data.writeBigUInt64LE(amount, 64);
+    return { address: which === "base" ? baseVault : quoteVault, owner: TOKEN_PROGRAM_ID, data };
+  };
+  const mintData = Buffer.alloc(82);
+  mintData.writeBigUInt64LE(1_000_000_000_000_000n, 36);
+  const global = Buffer.alloc(8 + 313);
+  GLOBAL_CONFIG_DISC.copy(global, 0);
+  global.writeBigUInt64LE(20n, 40);
+  global.writeBigUInt64LE(5n, 48);
+  global.writeBigUInt64LE(5n, 8 + 305);
+  const fees = Buffer.alloc(8 + 1 + 32 + 24 + 4 + 16 + 24 + 4 + 24);
+  FEE_CONFIG_DISC.copy(fees, 0);
+  let feeCursor = 8 + 1 + 32 + 24;
+  fees.writeUInt32LE(1, feeCursor);
+  feeCursor += 4 + 16;
+  fees.writeBigUInt64LE(20n, feeCursor);
+  fees.writeBigUInt64LE(5n, feeCursor + 8);
+  fees.writeBigUInt64LE(5n, feeCursor + 16);
+  feeCursor += 24;
+  fees.writeUInt32LE(0, feeCursor);
+  const accounts = {
+    mint: mint.toBase58(),
+    baseIn: 1_000_000n,
+    poolAccount: { address: derived.address, owner: PUMP_AMM_PROGRAM_ID, data: poolData },
+    baseVault: vault("base", 2_000_000_000_000n),
+    quoteVault: vault("quote", 5_000_000_000n),
+    baseMintAccount: { address: mint.toBase58(), owner: TOKEN_PROGRAM_ID, data: mintData },
+    globalConfigAccount: { address: "global", owner: PUMP_AMM_PROGRAM_ID, data: global },
+    feeConfigAccount: { address: "fees", owner: PUMP_FEE_PROGRAM_ID, data: fees },
+  };
+  const ok = assessPoolAccounts(accounts);
+  assert.equal(ok.status, "executable", ok.status);
+  assert.equal(ok.validated, true);
+  assert.equal(ok.quote.userQuote > 0n, true);
+  assert.equal(assessPoolAccounts({ ...accounts, baseVault: vault("base", 0n), quoteVault: vault("quote", 5n) }).status, "zero_liquidity");
+  const wrong = Buffer.from(poolData);
+  wrong.writeUInt16LE(1, 9);
+  assert.equal(assessPoolAccounts({ ...accounts, poolAccount: { ...accounts.poolAccount, data: wrong } }).status, "not_canonical_migration_pool");
+  assert.equal(assessPoolAccounts({ ...accounts, poolAccount: null }).status, "missing_pool");
+
+  const full = createComparison();
+  for (let i = 0; i < 3; i++) {
+    const at = i * 30_000;
+    const decision = full.trySignal({ mint: `C${i}`, ...reserves() }, at);
+    assert.equal(decision.pre.accepted, true);
+    assert.equal(decision.post.accepted, true);
+  }
+  assert.equal(full.trySignal({ mint: "C3", ...reserves() }, 90_000).pre.reason, "max_positions");
+  full.observe("C0", { complete: false, ...reserves(FILL_97), slot: 1 }, 91_000);
+  assert.equal(full.pre.snapshot().active.length, 2);
+  assert.equal(full.post.snapshot().active.length, 3);
+  assert.equal(full.trySignal({ mint: "C3", ...reserves() }, 121_000).pre.accepted, true);
+  assert.equal(full.trySignal({ mint: "C4", ...reserves() }, 121_000).post.reason, "max_positions");
+  assertLedgerConserved(full.pre.snapshot());
+  assertLedgerConserved(full.post.snapshot());
 });

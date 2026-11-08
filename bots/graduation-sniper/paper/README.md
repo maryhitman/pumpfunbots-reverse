@@ -21,13 +21,14 @@ node bots/graduation-sniper/paper/run.mjs \
 
 ```bash
 node bots/graduation-sniper/paper/run.mjs \
+  --compare \
   --public-readonly \
-  --duration-sec 300 \
-  --json-out paper-runs/public-report.json \
-  --log-out paper-runs/public.log
+  --duration-sec 600 \
+  --json-out paper-runs/compare-report.json \
+  --log-out paper-runs/compare.log
 ```
 
-`--duration-sec` must be an integer from 1 to 330. The process exits when that window ends. It is not a daemon.
+The process exits when the window ends. It is not a daemon.
 
 Public reads try only these endpoints, in order:
 
@@ -38,18 +39,25 @@ Methods used: `getSlot`, `getAccountInfo`, `logsSubscribe`, `logsUnsubscribe`. A
 
 ## Strategy defaults
 
-These are the original `graduation.mjs` defaults. The runnable entrypoint does not expose overrides.
+Entry, size, and risk limits stay on the original `graduation.mjs` numbers. The runnable comparison does not turn those into live orders.
 
 | Knob | Value |
 | --- | --- |
-| Trigger | virtual SOL reserves at least 92% of 85 SOL, and under 100% |
+| Entry | virtual SOL reserves at least 92% of 85 SOL |
 | Buy size | 0.1 simulated SOL |
-| Take profit | 1.5x pre-trade spot |
-| Stop loss | 0.7x pre-trade spot |
+| Take profit | 1.5x pre-trade spot, while the curve is still open |
+| Stop loss | 0.7x pre-trade spot, while the curve is still open |
 | Timeout | 300 seconds |
 | Positions | 3 |
 | Cooldown | 30 seconds |
-| Virtual cash | 10 SOL |
+| Virtual cash | 10 SOL per book |
+
+`--compare` runs two modified books on the same events. Each starts at 10 virtual SOL. Both use the original entry band, `fill >= 92%` and `fill < 100%`.
+
+- **A `exit-at-97`.** Attempts a bonding-curve exit only when a curve read has `complete=false` and fill is at least 97% and still under 100% (configurable with `--early-exit-pct`, default 97). The mark uses that observed reserve state. It is not rewritten to a 97% price. A read at or above 100% fill, or a graduated, missing, or unreadable read, does not receive a backfilled 97% sale. Graduated, missing, and unreadable reads are missed exits: cash stays reserved and no profit is booked. A pre-graduation exit is not guaranteed.
+- **B `pumpswap-immediate`.** Holds through graduation. The labeled rule is the first validated PumpSwap quote after that observation. Migration does not imply liquidity. A missing, unverified, stale, zero-liquidity, or rate-limited pool stays pending or becomes a missed exit. No post-graduation price is taken from the `complete` flag.
+
+`--strategy modified` is the single book that also refuses new entries at or above 97%. `--strategy original` is the comparison baseline: entry under 100%, no 97% exit, and no PumpSwap quote. `--duration-sec` is an integer from 1 to 660.
 
 A buy also needs both ledgers to still hold 0.1 SOL. The original dry-run does not check cash. When this runner refuses for cash, the decision is `insufficient_virtual_cash` and `originalWouldOpen` is true.
 

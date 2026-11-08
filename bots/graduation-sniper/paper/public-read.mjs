@@ -1,6 +1,13 @@
 import { PublicKey } from "@solana/web3.js";
 import { PUMP_PROGRAM } from "../../../lib/constants.mjs";
 import { parsePumpLogValue } from "./parse-log.mjs";
+import {
+  assessPoolAccounts,
+  canonicalPoolAddress,
+  decodePool,
+  feeConfigAddress,
+  globalConfigAddress,
+} from "./pumpswap-quote.mjs";
 
 export const READ_ONLY_HTTP_METHODS = Object.freeze(["getAccountInfo", "getSlot"]);
 export const READ_ONLY_WS_METHODS = Object.freeze(["logsSubscribe", "logsUnsubscribe"]);
@@ -128,23 +135,112 @@ function waitOpen(ws, timeoutMs) {
   });
 }
 
-async function pollOpenPositions(http, session, pollErrors) {
-  const mints = session.activeOpenMints();
-  for (const mint of mints) {
+async function accountAt(http, address) {
+  const result = await rpc(http, "getAccountInfo", [address, { encoding: "base64", commitment: "confirmed" }]);
+  const value = result?.value;
+  const slot = result?.context?.slot ?? null;
+  if (!value || !Array.isArray(value.data)) return { info: null, slot };
+  return { info: { address, owner: value.owner, data: Buffer.from(value.data[0], "base64") }, slot };
+}
+
+const sharedFeeAccounts = { at: 0, global: null, fees: null, slot: null };
+
+async function feeAccounts(http) {
+  if (sharedFeeAccounts.global && Date.now() - sharedFeeAccounts.at < 30_000) return sharedFeeAccounts;
+  const global = await accountAt(http, globalConfigAddress());
+  const fees = await accountAt(http, feeConfigAddress());
+  sharedFeeAccounts.at = Date.now();
+  sharedFeeAccounts.global = global.info;
+  sharedFeeAccounts.fees = fees.info;
+  sharedFeeAccounts.slot = global.slot;
+  return sharedFeeAccounts;
+}
+
+async function loadPoolView(http, mint, baseIn) {
+  try {
+    const derived = canonicalPoolAddress(mint);
+    const poolRead = await accountAt(http, derived.address);
+    if (!poolRead.info) return { status: "missing_pool", validated: false, slot: poolRead.slot };
+    const decoded = decodePool(poolRead.info.data);
+    if (!decoded) return { status: "layout_short", validated: false, slot: poolRead.slot };
+    const [baseVault, quoteVault, baseMint] = await Promise.all([
+      accountAt(http, decoded.poolBaseTokenAccount),
+      accountAt(http, decoded.poolQuoteTokenAccount),
+      accountAt(http, mint),
+    ]);
+    const fees = await feeAccounts(http);
+    const slots = [poolRead.slot, baseVault.slot, quoteVault.slot, baseMint.slot, fees.slot];
+    if (slots.some((slot) => !Number.isInteger(slot)) || slots.some((slot) => slot !== slots[0])) {
+      return { status: "stale", validated: false, slot: poolRead.slot };
+    }
+    const assessed = assessPoolAccounts({
+      mint,
+      baseIn,
+      poolAccount: poolRead.info,
+      baseVault: baseVault.info,
+      quoteVault: quoteVault.info,
+      baseMintAccount: baseMint.info,
+      globalConfigAccount: fees.global,
+      feeConfigAccount: fees.fees,
+    });
+    return {
+      status: assessed.status,
+      validated: assessed.validated,
+      slot: slots[0],
+      userQuoteLamports: assessed.quote?.userQuoteLamports ?? null,
+      lpFeeLamports: assessed.quote?.lpFee ?? null,
+      protocolFeeLamports: assessed.quote?.protocolFee ?? null,
+      creatorFeeLamports: assessed.quote?.creatorFee ?? null,
+      formula: assessed.quote?.formula,
+    };
+  } catch (err) {
+    const message = err.message || String(err);
+    return { status: /429|rate|timeout/i.test(message) ? "rate_limited" : "unread", validated: false, error: message };
+  }
+}
+
+function curveStateFromRpc(result) {
+  const state = decodeBondingCurveAccount(result?.value);
+  if (state == null) return { missing: true, slot: result?.context?.slot };
+  state.slot = result?.context?.slot;
+  return state;
+}
+
+async function pollSessions(http, sessions, pollErrors, log) {
+  const open = [...new Set(sessions.flatMap((session) => session.activeOpenMints()))];
+  for (const mint of open) {
     try {
-      const address = bondingCurveAddress(mint);
       const result = await rpc(http, "getAccountInfo", [
-        address,
+        bondingCurveAddress(mint),
         { encoding: "base64", commitment: "confirmed" },
       ]);
-      session.observe(mint, decodeBondingCurveAccount(result?.value), Date.now());
+      const state = curveStateFromRpc(result);
+      const now = Date.now();
+      for (const session of sessions) {
+        const outcome = session.observe(mint, state, now);
+        if (outcome.reason === "unpriceable" || outcome.reason === "pending_pool" || outcome.modelMark) {
+          log(`[PAPER] ${session.config.strategy} curve mint=${mint} reason=${outcome.reason} missedEarlyExit=${outcome.missedEarlyExit === true} onChainSell=false`);
+        }
+      }
     } catch (err) {
       pollErrors.push({ mint, message: err.message });
     }
   }
+  const pending = [...new Set(sessions.flatMap((session) => session.pendingPoolMints()))];
+  for (const mint of pending) {
+    for (const session of sessions) {
+      const baseIn = session.simulatedTokens(mint);
+      if (baseIn == null) continue;
+      const view = await loadPoolView(http, mint, baseIn);
+      const outcome = session.observePool(mint, view, Date.now());
+      if (outcome.reason !== "not_pending" && outcome.reason !== "no_position") {
+        log(`[PAPER] ${session.config.strategy} pool mint=${mint} reason=${outcome.reason} poolStatus=${outcome.poolStatus ?? "executable"} modelPnl=${outcome.modelMark ? outcome.modelMark.improved.pnl.sol : "none"}`);
+      }
+    }
+  }
 }
 
-function runStream({ ws, parser, subId, http, session, log, durationSec, pollMs }) {
+function runStream({ ws, parser, subId, http, sessions, log, durationSec, pollMs }) {
   const started = Date.now();
   const deadline = started + durationSec * 1000;
   const counters = { notifications: 0, tradeEvents: 0, parseErrors: 0, pollErrors: [] };
@@ -171,15 +267,16 @@ function runStream({ ws, parser, subId, http, session, log, durationSec, pollMs 
     };
 
     const pollTimer = setInterval(() => {
-      pollOpenPositions(http, session, counters.pollErrors).catch((err) => {
+      pollSessions(http, sessions, counters.pollErrors, log).catch((err) => {
         counters.pollErrors.push({ mint: null, message: err.message });
       });
       if (Date.now() - lastBeat >= 30_000) {
         lastBeat = Date.now();
-        const snap = session.snapshot();
-        log(
-          `[PAPER] heartbeat notifications=${counters.notifications} inBand=${snap.stats.inBand} open=${snap.active.length} modelMarks=${snap.stats.curveMarks} unpriceable=${snap.stats.unpriceable}`,
-        );
+        const parts = sessions.map((session) => {
+          const snap = session.snapshot();
+          return `${snap.strategy.name} open=${snap.active.filter((p) => p.status === "open").length} pending=${snap.stats.pendingPool} closed=${snap.stats.curveMarks} missed=${snap.stats.missedEarlyExits + snap.stats.missedExits} unpriceable=${snap.stats.unpriceable}`;
+        });
+        log(`[PAPER] heartbeat notifications=${counters.notifications} ${parts.join(" | ")}`);
       }
     }, pollMs);
 
@@ -194,6 +291,7 @@ function runStream({ ws, parser, subId, http, session, log, durationSec, pollMs 
         const event = parsePumpLogValue(msg.params?.result?.value);
         if (!event) return;
         counters.tradeEvents += 1;
+        for (const session of sessions) {
         const decision = session.trySignal(
           {
             mint: event.mint,
@@ -204,8 +302,9 @@ function runStream({ ws, parser, subId, http, session, log, durationSec, pollMs 
         );
         if (decision.reason !== "below_fill" && decision.reason !== "fill_at_or_above_100") {
           log(
-            `[PAPER] signal mint=${event.mint} fill=${Number(decision.fillPct).toFixed(2)} accepted=${decision.accepted} reason=${decision.reason}`,
+            `[PAPER] ${session.config.strategy} signal mint=${event.mint} fill=${Number(decision.fillPct).toFixed(2)} accepted=${decision.accepted} reason=${decision.reason}`,
           );
+        }
         }
       } catch (err) {
         counters.parseErrors += 1;
@@ -220,7 +319,7 @@ function runStream({ ws, parser, subId, http, session, log, durationSec, pollMs 
   });
 }
 
-async function streamEndpoint({ endpoint, session, log, durationSec, pollMs }) {
+async function streamEndpoint({ endpoint, sessions, log, durationSec, pollMs }) {
   if (typeof WebSocket !== "function") throw new Error("global WebSocket is unavailable");
   const slotResult = await rpc(endpoint.http, "getSlot", [{ commitment: "confirmed" }]);
   const slot = typeof slotResult === "number" ? slotResult : slotResult?.slot ?? slotResult;
@@ -247,7 +346,7 @@ async function streamEndpoint({ endpoint, session, log, durationSec, pollMs }) {
       parser,
       subId: ack.result,
       http: endpoint.http,
-      session,
+      sessions,
       log,
       durationSec,
       pollMs,
@@ -293,12 +392,18 @@ function publicAttempt(attempt) {
   };
 }
 
-export async function runReadOnlySession({ endpoints, durationSec, session, log, pollMs }) {
+export async function runReadOnlySession({ endpoints, durationSec, session, sessions, log, pollMs }) {
   const attempts = [];
   for (const endpoint of endpoints) {
     log(`[PAPER] probing ${endpoint.name} http=${endpoint.http} ws=${endpoint.ws}`);
     try {
-      const used = await streamEndpoint({ endpoint, session, log, durationSec, pollMs });
+      const used = await streamEndpoint({
+        endpoint,
+        sessions: sessions ?? [session],
+        log,
+        durationSec,
+        pollMs,
+      });
       const attempt = publicAttempt({ ...used, ok: true, error: null });
       attempts.push(attempt);
       return { ok: true, attempts, used: attempt };

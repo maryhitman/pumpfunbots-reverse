@@ -5,7 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { ASSUMPTION_LINES, LIMITATION_LINES, PAPER_ASSUMPTIONS } from "./defaults.mjs";
-import { assertLedgerConserved, createPaperSession } from "./engine.mjs";
+import { assertLedgerConserved, createComparison, createPaperSession } from "./engine.mjs";
 import { evaluateInvocation } from "./guard.mjs";
 import { replayFixture } from "./replay.mjs";
 import { analyzeGraduationSource, analyzePumpfunFormula } from "./review-source.mjs";
@@ -21,18 +21,26 @@ function readReview() {
   };
 }
 
-function bannerLines(review, ignoredEnv) {
+function bannerLines(review, decision) {
   const lines = [
     "=== GRADUATION SNIPER — PAPER ONLY ===",
-    "VIRTUAL STARTING BALANCE: 10 SOL",
-    "This balance is simulated. It is not a wallet, not an account, and not withdrawable.",
+    "VIRTUAL STARTING BALANCE: 10 SOL each book. Simulated cash. Not a wallet, not withdrawable.",
     "No key file is read. No transaction is signed or broadcast.",
-    "Strategy defaults from graduation.mjs: fill>=92% of 85 virtual SOL and fill<100, buy 0.1 SOL, TP 1.5x, SL 0.7x, timeout 300s, max 3 positions, cooldown 30s.",
-    "Two ledgers run on the same triggers.",
-    "  faithful: original dry-run spot ratio, no fee, no price impact (optimistic).",
-    "  improved: repo calcBuyTokens/calcSellSol with truncating 1% fee and constant product.",
-    "Graduated, missing, and unreadable curves are unpriceable. Slots stay locked. No model sell is booked.",
+    "Shared safeguards from graduation.mjs: entry fill>=92% of 85 virtual SOL, buy 0.1 SOL, TP 1.5x, SL 0.7x, timeout 300s, max 3 positions, cooldown 30s.",
+    "Faithful curve ledger: original dry-run spot ratio, no fee, no impact.",
+    "Improved curve ledger: repo calcBuyTokens/calcSellSol with truncating 1% fee.",
+    "A PumpSwap mark uses the documented sellBaseInput quote only after the pool, vaults, mint, and fee schedule validate. It is not a spot fill.",
   ];
+  if (decision.compare) {
+    lines.push(`COMPARE: two modified books on the same events. Each starts at 10 virtual SOL. Entry band is the original >=92% and <100%.`);
+    lines.push(`A exit-at-97: attempt a curve exit when a read shows complete=false and fill >= ${decision.earlyExitFillPct}% and fill < 100%. The mark uses that observed state, not a backfilled ${decision.earlyExitFillPct}% price. A read at or above 100% fill, or a graduated, missing, or unreadable read, is not a 97% sale. Missed exits keep cash reserved.`);
+    lines.push("B pumpswap-immediate: hold through graduation. The primary rule is the first validated PumpSwap pool quote after that observation. Migration does not imply liquidity or a price. Missing, unverified, stale, zero-liquidity, or rate-limited reads stay pending or become a missed exit with no booked profit.");
+    lines.push("Neither pre-graduation exit nor a post-graduation pool exit is guaranteed. original comparison mode remains --strategy original.");
+  } else if (decision.strategy === "modified") {
+    lines.push(`STRATEGY: modified, not the exact original. New entries stop at fill >= ${decision.earlyExitFillPct}%. An open position exits on a curve read with complete=false and fill >= ${decision.earlyExitFillPct}%, priced at the observed reserves.`);
+  } else {
+    lines.push("STRATEGY: original comparison mode. Entry is fill >= 92% and fill < 100%. No 97% exit and no PumpSwap quote.");
+  }
   if (!review.graduation.allHold || !review.curveFormula.allHold) {
     lines.push("SOURCE REVIEW MISMATCH: the original files no longer match the recorded findings. See the JSON report.");
   } else {
@@ -41,15 +49,18 @@ function bannerLines(review, ignoredEnv) {
   for (const finding of review.graduation.findings) {
     lines.push(`  [${finding.holds ? "holds" : "DOES NOT HOLD"}] ${finding.id}: ${finding.detail}`);
   }
-  if (ignoredEnv.length) {
-    lines.push(`Ignored environment overrides: ${ignoredEnv.join(", ")}`);
+  if (decision.ignoredEnv.length) {
+    lines.push(`Ignored environment overrides: ${decision.ignoredEnv.join(", ")}`);
   }
   return lines;
 }
 
 function decisionLine(prefix, result) {
-  if (result.reason === "unpriceable" || result.reason === "already_unpriceable") {
-    return `${prefix} UNPRICEABLE mint=${result.mint} reason=${result.unpriceableReason} modelPnl=none slotLocked=true onChainSell=false`;
+  if (result.reason === "unpriceable" || result.reason === "already_unpriceable" || result.reason === "missed_exit") {
+    return `${prefix} UNPRICEABLE mint=${result.mint} reason=${result.unpriceableReason ?? result.reason} missedEarlyExit=${result.missedEarlyExit === true} modelPnl=none slotLocked=true onChainSell=false`;
+  }
+  if (result.reason === "pending_pool") {
+    return `${prefix} PENDING POOL mint=${result.mint} status=${result.poolStatus ?? "waiting"} modelPnl=none cashReserved=true`;
   }
   if (result.modelMark) {
     const mark = result.modelMark;
@@ -68,13 +79,14 @@ function decisionLine(prefix, result) {
 }
 
 function summaryLines(snapshot) {
+  const open = snapshot.active.filter((position) => position.status === "open").length;
+  const pending = snapshot.active.filter((position) => position.status === "pending_pool").length;
   const lines = [
-    "=== PAPER SUMMARY ===",
-    `Virtual cash faithful: ${snapshot.ledgers.faithful.cash.sol} SOL (start ${snapshot.startingBalance.sol})`,
-    `Virtual cash improved: ${snapshot.ledgers.improved.cash.sol} SOL (start ${snapshot.startingBalance.sol})`,
-    `Counterfactual model mark PnL faithful: ${snapshot.ledgers.faithful.modelMarkPnl.sol} SOL`,
-    `Counterfactual model mark PnL improved: ${snapshot.ledgers.improved.modelMarkPnl.sol} SOL`,
-    "These model marks are not realized profits and not successful sells.",
+    `=== ${snapshot.strategy.name} ===`,
+    `Virtual cash faithful: ${snapshot.ledgers.faithful.cash.sol} SOL. Improved/quote cash: ${snapshot.ledgers.improved.cash.sol} SOL. Start ${snapshot.startingBalance.sol}.`,
+    `Modeled mark PnL faithful: ${snapshot.ledgers.faithful.modelMarkPnl.sol} SOL. Fee-adjusted or curve-improved: ${snapshot.ledgers.improved.modelMarkPnl.sol} SOL.`,
+    `Closed marks: ${snapshot.stats.curveMarks}. Early exits: ${snapshot.stats.earlyExits}. PumpSwap exits: ${snapshot.stats.pumpswapExits}. Open: ${open}. Pending pool: ${pending}. Unpriceable: ${snapshot.stats.unpriceable}. Missed early exits: ${snapshot.stats.missedEarlyExits}. Other missed exits: ${snapshot.stats.missedExits}.`,
+    "These figures are counterfactual model marks, not realized profits and not proof of profitability.",
     `On-chain realized SOL: null. Successful on-chain sells: ${snapshot.successfulOnChainSells}. Orders placed: ${snapshot.ordersPlaced}.`,
   ];
   if (snapshot.performanceIncomplete) {
@@ -87,8 +99,9 @@ function summaryLines(snapshot) {
   return lines;
 }
 
-function buildReport({ mode, decision, review, snapshot, data }) {
+function buildReport({ mode, decision, review, snapshot, books, data, comparisonVerdict }) {
   return {
+    comparisonVerdict,
     program: "graduation-sniper-paper",
     mode: "paper-only",
     failClosed: true,
@@ -111,6 +124,7 @@ function buildReport({ mode, decision, review, snapshot, data }) {
     sourceReview: review,
     data,
     session: snapshot,
+    books,
   };
 }
 
@@ -138,34 +152,63 @@ async function main() {
   }
 
   const review = readReview();
-  const lines = bannerLines(review, decision.ignoredEnv);
+  const lines = bannerLines(review, decision);
   const log = (line) => {
     lines.push(line);
     console.log(line);
   };
   for (const line of lines) console.log(line);
 
-  const session = createPaperSession();
+  const comparison = decision.compare
+    ? createComparison({ earlyExitFillPct: decision.earlyExitFillPct })
+    : null;
+  const sessions = comparison
+    ? [comparison.pre, comparison.post]
+    : [createPaperSession(decision.strategy === "original" ? { strategy: "original" } : { strategy: "modified", earlyExitFillPct: decision.earlyExitFillPct })];
   let data;
   let exitCode = 0;
 
   if (decision.mode === "fixture") {
     const fixturePath = path.resolve(decision.fixture);
     const fixture = JSON.parse(fs.readFileSync(fixturePath, "utf8"));
-    const replayed = replayFixture(session, fixture);
-    for (const step of replayed) {
-      const row = decisionLine("[PAPER]", step.result);
-      if (row) log(row);
+    if (comparison) {
+      for (const event of fixture.events) {
+        if (event.type === "trade") {
+          const both = comparison.trySignal(event, event.atMs);
+          for (const [name, result] of [["A", both.pre], ["B", both.post]]) {
+            const row = decisionLine(`[PAPER ${name}]`, result);
+            if (row) log(row);
+          }
+        } else if (event.type === "curve") {
+          const both = comparison.observe(event.mint, event.state, event.atMs);
+          for (const [name, result] of [["A", both.pre], ["B", both.post]]) {
+            const row = decisionLine(`[PAPER ${name}]`, result);
+            if (row) log(row);
+          }
+        } else if (event.type === "pool") {
+          const result = comparison.observePool(event.mint, event.view, event.atMs);
+          const row = decisionLine("[PAPER B]", result);
+          if (row) log(row);
+        } else {
+          throw new Error(`unknown fixture event ${event.type}`);
+        }
+      }
+    } else {
+      const replayed = replayFixture(sessions[0], fixture);
+      for (const step of replayed) {
+        const row = decisionLine("[PAPER]", step.result);
+        if (row) log(row);
+      }
     }
-    data = { kind: "fixture", path: fixturePath, ok: true, error: null };
+    data = { kind: "fixture", path: fixturePath, ok: true, error: null, compare: decision.compare };
   } else {
     const { runReadOnlySession } = await import("./public-read.mjs");
     const live = await runReadOnlySession({
       endpoints: decision.endpoints,
       durationSec: decision.durationSec,
-      session,
+      sessions,
       log,
-      pollMs: session.config.pollMs,
+      pollMs: sessions[0].config.pollMs,
     });
     data = { kind: "public-readonly", durationSec: decision.durationSec, ...live };
     if (!live.ok) {
@@ -177,16 +220,28 @@ async function main() {
     }
   }
 
-  const snapshot = session.snapshot();
-  for (const line of summaryLines(snapshot)) log(line);
-  const report = buildReport({ mode: decision.mode, decision, review, snapshot, data });
-  writeOutputs(decision, report, lines);
-  try {
+  const books = sessions.map((session) => session.snapshot());
+  for (const snapshot of books) {
+    for (const line of summaryLines(snapshot)) log(line);
     assertLedgerConserved(snapshot);
-  } catch (err) {
-    console.error(`[PAPER] LEDGER CHECK FAILED: ${err.message}`);
-    process.exit(1);
   }
+  const graduatedOrClosed = books.some((snapshot) =>
+    snapshot.stats.curveMarks > 0 || snapshot.stats.pendingPool > 0 || snapshot.stats.missedEarlyExits > 0 || snapshot.stats.missedExits > 0 || snapshot.stats.unpriceable > 0);
+  if (decision.compare) {
+    log(graduatedOrClosed
+      ? "[PAPER] Comparison is descriptive only. It does not name a winner and it is not proof of profitability."
+      : "[PAPER] INSUFFICIENT SAMPLE: neither book recorded a graduation, a pool exit, or a missed exit. No winner.");
+  }
+  const report = buildReport({
+    mode: decision.mode,
+    decision,
+    review,
+    snapshot: books[0],
+    books,
+    data,
+    comparisonVerdict: decision.compare ? (graduatedOrClosed ? "descriptive-only" : "insufficient-sample") : null,
+  });
+  writeOutputs(decision, report, lines);
   process.exit(exitCode);
 }
 

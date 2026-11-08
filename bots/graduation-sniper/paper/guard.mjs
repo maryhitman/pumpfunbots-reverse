@@ -1,3 +1,5 @@
+import { MODIFIED_EARLY_EXIT_FILL_PCT, STRATEGY_DEFAULTS } from "./defaults.mjs";
+
 // Fail-closed argument and environment gate. No network and no key files.
 
 export const PUBLIC_ENDPOINTS = Object.freeze([
@@ -53,7 +55,11 @@ const FLAGS_WITH_VALUES = new Set([
   "--log-out",
   "--rpc-http",
   "--rpc-ws",
+  "--strategy",
+  "--early-exit-pct",
 ]);
+
+export const MAX_PUBLIC_DURATION_SEC = 660;
 
 function refuse(message, ignoredEnv) {
   return { ok: false, exitCode: 2, message, ignoredEnv };
@@ -88,11 +94,19 @@ export function evaluateInvocation(argv, env = process.env) {
   let logOut = null;
   let http = null;
   let ws = null;
+  let strategy = "modified";
+  let compare = false;
+  let earlyExitPassed = false;
+  let earlyExitFillPct = MODIFIED_EARLY_EXIT_FILL_PCT;
 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
     if (arg === "--public-readonly") {
       publicRead = true;
+      continue;
+    }
+    if (arg === "--compare") {
+      compare = true;
       continue;
     }
     if (!FLAGS_WITH_VALUES.has(arg)) {
@@ -110,11 +124,36 @@ export function evaluateInvocation(argv, env = process.env) {
     else if (arg === "--log-out") logOut = value;
     else if (arg === "--rpc-http") http = value;
     else if (arg === "--rpc-ws") ws = value;
+    else if (arg === "--strategy") strategy = value;
+    else if (arg === "--early-exit-pct") {
+      earlyExitPassed = true;
+      earlyExitFillPct = Number(value);
+    }
   }
 
-  if ((publicRead || durationPassed) && (!Number.isInteger(durationSec) || durationSec < 1 || durationSec > 330)) {
+  if (compare && args.includes("--strategy")) {
+    return refuse("--compare runs exit-at-97 and pumpswap-immediate together. Do not also pass --strategy.", ignoredEnv);
+  }
+  if (!compare && strategy !== "modified" && strategy !== "original") {
+    return refuse("--strategy must be modified or original. Use --compare for the 97% exit versus immediate PumpSwap exit.", ignoredEnv);
+  }
+  if (!compare && strategy === "original" && earlyExitPassed) {
+    return refuse("--early-exit-pct belongs to the modified paper strategy. original comparison mode does not take it.", ignoredEnv);
+  }
+  if (compare || strategy === "modified") {
+    if (!Number.isFinite(earlyExitFillPct) || earlyExitFillPct <= STRATEGY_DEFAULTS.minFillPct || earlyExitFillPct >= 100) {
+      return refuse(
+        `--early-exit-pct must be above the ${STRATEGY_DEFAULTS.minFillPct}% entry and below 100. Default is ${MODIFIED_EARLY_EXIT_FILL_PCT}.`,
+        ignoredEnv,
+      );
+    }
+  } else {
+    earlyExitFillPct = null;
+  }
+
+  if ((publicRead || durationPassed) && (!Number.isInteger(durationSec) || durationSec < 1 || durationSec > MAX_PUBLIC_DURATION_SEC)) {
     return refuse(
-      "--duration-sec must be an integer from 1 to 330. This entrypoint will not run as a daemon.",
+      `--duration-sec must be an integer from 1 to ${MAX_PUBLIC_DURATION_SEC}. This entrypoint will not run as a daemon.`,
       ignoredEnv,
     );
   }
@@ -145,5 +184,8 @@ export function evaluateInvocation(argv, env = process.env) {
     jsonOut,
     logOut,
     endpoints,
+    strategy: compare ? "compare" : strategy,
+    compare,
+    earlyExitFillPct,
   };
 }
