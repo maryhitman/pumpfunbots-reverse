@@ -1,0 +1,385 @@
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import test from "node:test";
+import { PublicKey } from "@solana/web3.js";
+import { BUY_INSTRUCTIONS, PUMP_PROGRAM, TRADE_EVENT_PREFIX } from "../../../lib/constants.mjs";
+import { quoteBuy, quoteSell, spotRatioProceedsLamports } from "./curve.mjs";
+import { PAPER_ASSUMPTIONS, PUMP_PROGRAM_ID, STRATEGY_DEFAULTS, solToLamports } from "./defaults.mjs";
+import { assertLedgerConserved, createPaperSession } from "./engine.mjs";
+import { evaluateInvocation, PUBLIC_ENDPOINTS } from "./guard.mjs";
+import { decodeTradeEvent, parsePumpLogValue } from "./parse-log.mjs";
+import { READ_ONLY_HTTP_METHODS, READ_ONLY_WS_METHODS, bondingCurveAddress, decodeBondingCurveAccount } from "./public-read.mjs";
+import { replayFixture } from "./replay.mjs";
+import { analyzeGraduationSource, analyzePumpfunFormula } from "./review-source.mjs";
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+const repo = path.resolve(here, "..", "..", "..");
+const paperDir = here;
+const VSOL = 78_200_000_000n;
+const VTOK = 1_000_000_000_000_000n;
+const BUY = 100_000_000n;
+
+function reserves(virtualSolReserves = VSOL, virtualTokenReserves = VTOK) {
+  return { virtualSolReserves, virtualTokenReserves };
+}
+
+function productionSources() {
+  return fs.readdirSync(paperDir)
+    .filter((name) => name.endsWith(".mjs") && name !== "paper.test.mjs")
+    .map((name) => ({ name, src: fs.readFileSync(path.join(paperDir, name), "utf8") }));
+}
+
+test("strategy defaults match the original graduation sniper literals", () => {
+  const src = fs.readFileSync(path.join(paperDir, "..", "graduation.mjs"), "utf8");
+  assert.match(src, /GRAD_BUY_SOL \|\| 0\.1\)/);
+  assert.match(src, /GRAD_MIN_FILL_PCT \|\| 92\)/);
+  assert.match(src, /GRAD_TAKE_PROFIT \|\| 1\.5\)/);
+  assert.match(src, /GRAD_STOP_LOSS \|\| 0\.7\)/);
+  assert.match(src, /GRAD_TIMEOUT_SEC \|\| 300\)/);
+  assert.match(src, /GRAD_MAX_POSITIONS \|\| 3\)/);
+  assert.match(src, /GRAD_COOLDOWN_SEC \|\| 30\)/);
+  assert.match(src, /VIRTUAL_SOL_AT_GRADUATION = 85_000_000_000n/);
+  assert.equal(STRATEGY_DEFAULTS.buySol, 0.1);
+  assert.equal(STRATEGY_DEFAULTS.minFillPct, 92);
+  assert.equal(STRATEGY_DEFAULTS.takeProfitMultiple, 1.5);
+  assert.equal(STRATEGY_DEFAULTS.stopLossMultiple, 0.7);
+  assert.equal(STRATEGY_DEFAULTS.timeoutSec, 300);
+  assert.equal(STRATEGY_DEFAULTS.maxPositions, 3);
+  assert.equal(STRATEGY_DEFAULTS.cooldownSec, 30);
+  assert.equal(STRATEGY_DEFAULTS.virtualSolAtGraduationLamports, 85_000_000_000n);
+  assert.equal(PAPER_ASSUMPTIONS.startingVirtualSol, 10);
+  assert.equal(PAPER_ASSUMPTIONS.balanceKind, "VIRTUAL_PAPER_SOL");
+  assert.equal(solToLamports(10), 10_000_000_000n);
+  assert.equal(solToLamports(0.1), BUY);
+});
+
+test("upstream review findings still hold in this fork's original files", () => {
+  const graduation = analyzeGraduationSource(fs.readFileSync(path.join(paperDir, "..", "graduation.mjs"), "utf8"));
+  const formula = analyzePumpfunFormula(fs.readFileSync(path.join(repo, "lib", "pumpfun.mjs"), "utf8"));
+  assert.equal(graduation.allHold, true, JSON.stringify(graduation.findings, null, 2));
+  assert.equal(formula.allHold, true, JSON.stringify(formula.findings, null, 2));
+  assert.equal(PUMP_PROGRAM.toBase58(), PUMP_PROGRAM_ID);
+});
+
+test("paper sources have no wallet, sign, or send path", () => {
+  const bannedCalls = [
+    /loadKeypair\s*\(/,
+    /generateKeypair\s*\(/,
+    /fromSecretKey\s*\(/,
+    /sendTransaction\s*\(/,
+    /sendRawTransaction\s*\(/,
+    /simulateTransaction\s*\(/,
+    /requestAirdrop\s*\(/,
+    /partialSign\s*\(/,
+    /\.sign\s*\(/,
+    /new\s+Keypair\b/,
+    /new\s+Connection\b/,
+    /secretKey/,
+  ];
+  const web3Files = new Set(["parse-log.mjs", "public-read.mjs"]);
+  for (const file of productionSources()) {
+    for (const pattern of bannedCalls) {
+      assert.equal(pattern.test(file.src), false, `${file.name} matched ${pattern}`);
+    }
+    const imports = [
+      ...file.src.matchAll(/from\s+["']([^"']+)["']/g),
+      ...file.src.matchAll(/import\s*\(\s*["']([^"']+)["']/g),
+    ].map((match) => match[1]);
+    for (const specifier of imports) {
+      const allowed = specifier.startsWith("node:")
+        || specifier.startsWith("./")
+        || specifier === "../../../lib/constants.mjs"
+        || (specifier === "@solana/web3.js" && web3Files.has(file.name));
+      assert.equal(allowed, true, `${file.name} imports ${specifier}`);
+      assert.equal(/wallet|tx\.mjs|rpc\.mjs|pumpfun|config\.mjs|\/ws\.mjs/.test(specifier), false, specifier);
+    }
+  }
+  assert.deepEqual([...READ_ONLY_HTTP_METHODS], ["getAccountInfo", "getSlot"]);
+  assert.deepEqual([...READ_ONLY_WS_METHODS], ["logsSubscribe", "logsUnsubscribe"]);
+  const reader = fs.readFileSync(path.join(paperDir, "public-read.mjs"), "utf8");
+  assert.match(reader, /refusing RPC method/);
+  assert.match(reader, /refusing websocket method/);
+});
+
+test("curve quotes match the repository integer formula and the spot ledger omits fees", () => {
+  const fee = BUY / 100n;
+  const net = BUY - fee;
+  const tokens = (VTOK * net) / (VSOL + net);
+  const buy = quoteBuy(VSOL, VTOK, BUY);
+  assert.equal(buy.tokens, tokens);
+  assert.equal(buy.feeLamports, fee);
+  const sell = quoteSell(VSOL, VTOK, tokens);
+  const gross = (VSOL * tokens) / (VTOK + tokens);
+  assert.equal(sell.grossLamports, gross);
+  assert.equal(sell.proceedsLamports, gross - gross / 100n);
+  assert.ok(sell.proceedsLamports < BUY);
+  assert.equal(spotRatioProceedsLamports(BUY, VSOL, VTOK, VSOL, VTOK), BUY);
+  assert.equal(spotRatioProceedsLamports(BUY, VSOL, VTOK, 117_300_000_000n, VTOK), 150_000_000n);
+  assert.equal(spotRatioProceedsLamports(BUY, VSOL, VTOK, 54_740_000_000n, VTOK), 70_000_000n);
+});
+
+test("fill band, cooldown, size, and virtual cash constraints", () => {
+  const session = createPaperSession();
+  assert.equal(session.trySignal({ mint: "low", ...reserves(77_350_000_000n) }, 0).reason, "below_fill");
+  assert.equal(session.trySignal({ mint: "full", ...reserves(85_000_000_000n) }, 0).reason, "fill_at_or_above_100");
+  assert.equal(session.trySignal({ mint: "just-under", ...reserves(VSOL - 1n) }, 0).reason, "below_fill");
+  const opened = session.trySignal({ mint: "A", ...reserves() }, 0);
+  assert.equal(opened.accepted, true);
+  assert.equal(session.snapshot().ledgers.faithful.cash.sol, "9.900000000");
+  assert.equal(session.snapshot().active[0].spent.sol, "0.100000000");
+  assert.equal(session.trySignal({ mint: "B", ...reserves() }, 29_999).reason, "cooldown");
+  assert.equal(session.trySignal({ mint: "A", ...reserves() }, 30_000).reason, "duplicate_mint");
+  assert.equal(session.trySignal({ mint: "B", ...reserves() }, 30_000).accepted, true);
+
+  const poor = createPaperSession({ startingVirtualSol: 0.15 });
+  assert.equal(poor.trySignal({ mint: "C", ...reserves() }, 0).accepted, true);
+  const blocked = poor.trySignal({ mint: "D", ...reserves() }, 30_000);
+  assert.equal(blocked.reason, "insufficient_virtual_cash");
+  assert.equal(blocked.originalWouldOpen, true);
+  assert.equal(poor.snapshot().stats.opened, 1);
+  assert.equal(poor.snapshot().ledgers.faithful.cash.lamports, "50000000");
+  assert.equal(createPaperSession({ startingVirtualSol: 0 }).trySignal({ mint: "E", ...reserves() }, 0).reason, "insufficient_virtual_cash");
+});
+
+test("graduated and missing curves lock slots and book no model sell", () => {
+  const session = createPaperSession();
+  for (let i = 0; i < 3; i++) {
+    const at = i * 30_000;
+    assert.equal(session.trySignal({ mint: `M${i}`, ...reserves() }, at).accepted, true);
+    const marked = session.observe(`M${i}`, {
+      complete: true,
+      virtualSolReserves: VSOL * 5n,
+      virtualTokenReserves: VTOK,
+    }, at + 1_000);
+    assert.equal(marked.reason, "unpriceable");
+    assert.equal(marked.unpriceableReason, "graduated");
+    assert.equal(marked.modelMark, null);
+    assert.equal(marked.onChainSell, false);
+    assert.equal(marked.successfulSell, false);
+  }
+  const blocked = session.trySignal({ mint: "M3", ...reserves() }, 90_000);
+  assert.equal(blocked.reason, "max_positions");
+  assert.equal(blocked.originalWouldOpen, false);
+  const snap = session.snapshot();
+  assert.equal(snap.stats.curveMarks, 0);
+  assert.equal(snap.stats.unpriceable, 3);
+  assert.equal(snap.ledgers.faithful.modelMarkPnl.sol, "0.000000000");
+  assert.equal(snap.ledgers.improved.modelMarkPnl.sol, "0.000000000");
+  assert.equal(snap.ledgers.faithful.cash.sol, "9.700000000");
+  assert.equal(snap.successfulOnChainSells, 0);
+  assert.equal(snap.onChainRealizedSol, null);
+  assert.equal(snap.performanceIncomplete, true);
+  assert.equal(session.observe("M0", null, 120_000).reason, "already_unpriceable");
+
+  const missing = createPaperSession();
+  missing.trySignal({ mint: "gone", ...reserves() }, 0);
+  const result = missing.observe("gone", null, 1_000);
+  assert.equal(result.unpriceableReason, "curve_missing");
+  assert.equal(result.modelMark, null);
+  assert.equal(missing.snapshot().ledgers.improved.modelMarkPnl.sol, "0.000000000");
+  assertLedgerConserved(missing.snapshot());
+  assertLedgerConserved(snap);
+});
+
+test("faithful and improved ledgers diverge on curve exits without inventing a sell", () => {
+  const timeout = createPaperSession();
+  timeout.trySignal({ mint: "T", ...reserves() }, 0);
+  assert.equal(timeout.observe("T", { complete: false, ...reserves() }, 3_000).reason, "hold");
+  const timed = timeout.observe("T", { complete: false, ...reserves() }, 300_000);
+  assert.equal(timed.reason, "timeout");
+  assert.equal(timed.modelMark.onChainSell, false);
+  assert.equal(timed.modelMark.kind, "simulated_curve_mark");
+  assert.equal(timed.modelMark.faithful.pnl.sol, "0.000000000");
+  assert.ok(timed.modelMark.improved.pnl.sol.startsWith("-"));
+  assert.equal(timed.modelMark.improved.pnl.lamports, (quoteSell(VSOL, VTOK, quoteBuy(VSOL, VTOK, BUY).tokens).proceedsLamports - BUY).toString());
+  assert.equal(timeout.snapshot().active.length, 0);
+
+  const tp = createPaperSession();
+  tp.trySignal({ mint: "P", ...reserves() }, 0);
+  const took = tp.observe("P", { complete: false, virtualSolReserves: 117_300_000_000n, virtualTokenReserves: VTOK }, 10_000);
+  assert.equal(took.reason, "take_profit");
+  assert.equal(took.modelMark.faithful.pnl.sol, "0.050000000");
+  assert.notEqual(took.modelMark.improved.pnl.lamports, took.modelMark.faithful.pnl.lamports);
+  assert.equal(tp.snapshot().ledgers.faithful.cash.sol, "10.050000000");
+  assert.equal(took.successfulSell, false);
+
+  const sl = createPaperSession();
+  sl.trySignal({ mint: "S", ...reserves() }, 0);
+  const stopped = sl.observe("S", { complete: false, virtualSolReserves: 54_740_000_000n, virtualTokenReserves: VTOK }, 10_000);
+  assert.equal(stopped.reason, "stop_loss");
+  assert.equal(stopped.modelMark.faithful.pnl.sol, "-0.030000000");
+  assert.ok(BigInt(stopped.modelMark.improved.pnl.lamports) < BigInt(stopped.modelMark.faithful.pnl.lamports));
+
+  const priority = createPaperSession();
+  priority.trySignal({ mint: "both", ...reserves() }, 0);
+  const both = priority.observe("both", {
+    complete: false,
+    virtualSolReserves: 117_300_000_000n,
+    virtualTokenReserves: VTOK,
+  }, 400_000);
+  assert.equal(both.reason, "take_profit");
+  assertLedgerConserved(timeout.snapshot());
+  assertLedgerConserved(tp.snapshot());
+  assertLedgerConserved(sl.snapshot());
+});
+
+test("the same events produce the same snapshot", () => {
+  const fixture = JSON.parse(fs.readFileSync(path.join(paperDir, "fixtures", "mixed-outcome.json"), "utf8"));
+  const run = () => {
+    const session = createPaperSession();
+    replayFixture(session, fixture);
+    return session.snapshot();
+  };
+  const first = run();
+  const second = run();
+  assert.deepEqual(first, second);
+  assert.equal(first.startingBalance.kind, "VIRTUAL_PAPER_SOL");
+  assert.equal(first.startingBalance.sol, "10.000000000");
+  assert.equal(first.stats.opened, 4);
+  assert.equal(first.stats.curveMarks, 1);
+  assert.equal(first.stats.unpriceable, 2);
+  assert.equal(first.active.length, 3);
+  assert.equal(first.closed.length, 1);
+  assert.equal(first.closed[0].modelMark.faithful.pnl.sol, "0.000000000");
+  assert.ok(first.closed[0].modelMark.improved.pnl.sol.startsWith("-"));
+  assert.equal(first.closed[0].modelMark.onChainSell, false);
+  const reasons = Object.fromEntries(first.active.map((position) => [position.mint, position.unpriceableReason]));
+  assert.equal(reasons["mint-grad"], "graduated");
+  assert.equal(reasons["mint-missing"], "curve_missing");
+  assert.equal(reasons["mint-open"], null);
+  assert.equal(first.active.every((position) => position.modelMark == null), true);
+  assert.equal(first.ledgers.faithful.modelMarkPnl.sol, "0.000000000");
+  assert.equal(first.ledgers.faithful.cash.sol, "9.700000000");
+  assert.equal(first.recentDecisions.at(-1).reason, "max_positions");
+  assert.equal(first.ordersPlaced, 0);
+  assertLedgerConserved(first);
+});
+
+test("log parser follows the original buy-event gate", () => {
+  assert.deepEqual([...BUY_INSTRUCTIONS], ["Buy", "BuyV2", "BuyV3", "BuyExactQuoteInV2", "BuyExactQuoteInV3", "BuyExactSolIn"]);
+  const mint = new PublicKey("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
+  const user = new PublicKey("11111111111111111111111111111111");
+  const data = Buffer.alloc(129);
+  TRADE_EVENT_PREFIX.copy(data, 0);
+  mint.toBuffer().copy(data, 8);
+  data.writeBigUInt64LE(1_000_000_000n, 40);
+  data.writeBigUInt64LE(2_000_000n, 48);
+  user.toBuffer().copy(data, 57);
+  data.writeBigUInt64LE(VSOL, 97);
+  data.writeBigUInt64LE(VTOK, 105);
+  data.writeBigUInt64LE(3n, 113);
+  data.writeBigUInt64LE(4n, 121);
+  const encoded = data.toString("base64");
+  const parsed = parsePumpLogValue({
+    logs: [
+      "Program log: Instruction: BuyV3",
+      `Program data: ${encoded}`,
+      "Program 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P success",
+    ],
+  });
+  assert.equal(parsed.mint, mint.toBase58());
+  assert.equal(parsed.virtualSolReserves, VSOL);
+  assert.equal(parsed.virtualTokenReserves, VTOK);
+  assert.equal(decodeTradeEvent(data).realTokenReserves, 4n);
+  assert.equal(parsePumpLogValue({
+    logs: ["Program log: Instruction: SellV3", `Program data: ${encoded}`, "Program success"],
+  }), null);
+  assert.equal(parsePumpLogValue({
+    logs: ["Program log: Instruction: Buy", `Program data: ${encoded}`, "Program failed"],
+  }), null);
+  const account = Buffer.alloc(80);
+  account.writeBigUInt64LE(VTOK, 8);
+  account.writeBigUInt64LE(VSOL, 16);
+  account[48] = 1;
+  const decoded = decodeBondingCurveAccount({ data: [account.toString("base64"), "base64"] });
+  assert.equal(decoded.complete, true);
+  assert.equal(decoded.virtualSolReserves, VSOL);
+  assert.equal(decodeBondingCurveAccount(null), null);
+  assert.equal(decodeBondingCurveAccount({ data: [Buffer.alloc(10).toString("base64"), "base64"] }).unreadable, true);
+  const derived = bondingCurveAddress(mint.toBase58());
+  const again = PublicKey.findProgramAddressSync(
+    [Buffer.from("bonding-curve"), mint.toBuffer()],
+    PUMP_PROGRAM,
+  )[0].toBase58();
+  assert.equal(derived, again);
+  assert.match(fs.readFileSync(path.join(repo, "lib", "pumpfun.mjs"), "utf8"), /Buffer\.from\("bonding-curve"\)/);
+});
+
+test("the entrypoint refuses live flags, key material, and non-public RPCs", () => {
+  const refused = evaluateInvocation(["node", "run.mjs", "--live"], {});
+  assert.equal(refused.ok, false);
+  assert.equal(refused.exitCode, 2);
+  assert.equal(evaluateInvocation(["node", "run.mjs", "--send"], {}).ok, false);
+  assert.equal(evaluateInvocation(["node", "run.mjs", "--wallet"], {}).ok, false);
+  assert.equal(evaluateInvocation(["node", "run.mjs", "--dry-run"], {}).ok, false);
+  assert.match(evaluateInvocation(["node", "run.mjs", "--fixture", "x"], { PRIVATE_KEY: "nope" }).message, /PRIVATE_KEY/);
+  assert.match(
+    evaluateInvocation(["node", "run.mjs", "--public-readonly", "--rpc-http", "https://mainnet.helius-rpc.com/?api-key=abc", "--rpc-ws", "wss://mainnet.helius-rpc.com"], {}).message,
+    /allowlist/,
+  );
+  assert.equal(evaluateInvocation(["node", "run.mjs", "--public-readonly", "--duration-sec", "331"], {}).ok, false);
+  assert.equal(evaluateInvocation(["node", "run.mjs"], {}).ok, false);
+  const ok = evaluateInvocation(["node", "run.mjs", "--public-readonly"], { HELIUS_API_KEY: "ignored", GRAD_BUY_SOL: "5" });
+  assert.equal(ok.ok, true);
+  assert.deepEqual(ok.endpoints, PUBLIC_ENDPOINTS);
+  assert.deepEqual(ok.ignoredEnv, ["HELIUS_API_KEY", "GRAD_BUY_SOL"]);
+  assert.equal(ok.durationSec, 300);
+});
+
+function spawnPaper(args, envPatch = {}) {
+  const env = { ...process.env };
+  for (const key of ["PRIVATE_KEY", "SECRET_KEY", "SOLANA_PRIVATE_KEY", "WALLET_PRIVATE_KEY", "KEYPAIR", "KEYPAIR_JSON"]) {
+    delete env[key];
+  }
+  Object.assign(env, envPatch);
+  return spawnSync(process.execPath, [path.join(paperDir, "run.mjs"), ...args], {
+    cwd: repo,
+    env,
+    encoding: "utf8",
+  });
+}
+
+test("fixture command stays paper-only and ignores strategy overrides", () => {
+  const outDir = fs.mkdtempSync(path.join("/tmp", "grad-paper-"));
+  const jsonOut = path.join(outDir, "report.json");
+  const logOut = path.join(outDir, "paper.log");
+  const result = spawnPaper([
+    "--fixture",
+    path.join(paperDir, "fixtures", "mixed-outcome.json"),
+    "--json-out",
+    jsonOut,
+    "--log-out",
+    logOut,
+  ], { GRAD_BUY_SOL: "5", HELIUS_API_KEY: "not-used" });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.match(result.stdout, /VIRTUAL STARTING BALANCE: 10 SOL/);
+  assert.match(result.stdout, /not a wallet/i);
+  assert.doesNotMatch(result.stdout, /tx sent/);
+  assert.equal(fs.existsSync(path.join(repo, "keys")), false);
+  const report = JSON.parse(fs.readFileSync(jsonOut, "utf8"));
+  assert.equal(report.walletUsed, false);
+  assert.equal(report.keypairLoaded, false);
+  assert.equal(report.transactionsSigned, 0);
+  assert.equal(report.transactionsBroadcast, 0);
+  assert.equal(report.successfulOnChainSells, 0);
+  assert.equal(report.onChainRealizedSol, null);
+  assert.equal(report.startingBalance.sol, "10.000000000");
+  assert.equal(report.startingBalance.kind, "VIRTUAL_PAPER_SOL");
+  assert.equal(report.session.strategy.buySol, 0.1);
+  assert.equal(report.session.stats.unpriceable, 2);
+  assert.equal(report.session.ledgers.faithful.modelMarkPnl.sol, "0.000000000");
+  assert.ok(report.session.ledgers.improved.modelMarkPnl.sol.startsWith("-"));
+  assert.equal(report.sourceReview.graduation.allHold, true);
+  assert.equal(report.data.kind, "fixture");
+  assert.match(fs.readFileSync(logOut, "utf8"), /UNPRICEABLE/);
+  const live = spawnPaper(["--live"]);
+  assert.equal(live.status, 2);
+  assert.match(live.stderr, /REFUSED/);
+  assert.equal(fs.existsSync(path.join(repo, "keys")), false);
+  const keyed = spawnPaper(["--fixture", path.join(paperDir, "fixtures", "mixed-outcome.json")], { PRIVATE_KEY: "not-a-real-key" });
+  assert.equal(keyed.status, 2);
+  assert.match(keyed.stderr, /PRIVATE_KEY/);
+});

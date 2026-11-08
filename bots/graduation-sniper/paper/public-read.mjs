@@ -1,0 +1,318 @@
+import { PublicKey } from "@solana/web3.js";
+import { PUMP_PROGRAM } from "../../../lib/constants.mjs";
+import { parsePumpLogValue } from "./parse-log.mjs";
+
+export const READ_ONLY_HTTP_METHODS = Object.freeze(["getAccountInfo", "getSlot"]);
+export const READ_ONLY_WS_METHODS = Object.freeze(["logsSubscribe", "logsUnsubscribe"]);
+
+const HTTP_OK = new Set(READ_ONLY_HTTP_METHODS);
+const WS_OK = new Set(READ_ONLY_WS_METHODS);
+
+export function bondingCurveAddress(mint) {
+  return PublicKey.findProgramAddressSync(
+    [Buffer.from("bonding-curve"), new PublicKey(mint).toBuffer()],
+    PUMP_PROGRAM,
+  )[0].toBase58();
+}
+
+export function decodeBondingCurveAccount(accountValue) {
+  if (accountValue == null) return null;
+  const data = accountValue.data;
+  if (!Array.isArray(data) || typeof data[0] !== "string") return { unreadable: true };
+  const buf = Buffer.from(data[0], "base64");
+  if (buf.length < 73) return { unreadable: true };
+  return {
+    unreadable: false,
+    complete: buf[48] === 1,
+    virtualTokenReserves: buf.readBigUInt64LE(8),
+    virtualSolReserves: buf.readBigUInt64LE(16),
+    realTokenReserves: buf.readBigUInt64LE(24),
+    realSolReserves: buf.readBigUInt64LE(32),
+    tokenTotalSupply: buf.readBigUInt64LE(40),
+  };
+}
+
+async function rpc(url, method, params) {
+  if (!HTTP_OK.has(method)) throw new Error(`refusing RPC method ${method}`);
+  let response;
+  try {
+    response = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+      signal: AbortSignal.timeout(15000),
+    });
+  } catch (err) {
+    throw new Error(`${method} ${url} failed: ${err.message}`);
+  }
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status} ${method} ${url}: ${text.slice(0, 300)}`);
+  }
+  let body;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    throw new Error(`non-JSON ${method} ${url}: ${text.slice(0, 300)}`);
+  }
+  if (body.error) {
+    const code = body.error.code ?? "";
+    const message = body.error.message ?? JSON.stringify(body.error);
+    throw new Error(`RPC ${method} ${url}: ${code} ${message}`);
+  }
+  return body.result;
+}
+
+function asText(data) {
+  if (typeof data === "string") return data;
+  if (Buffer.isBuffer(data)) return data.toString("utf8");
+  if (data instanceof ArrayBuffer) return Buffer.from(data).toString("utf8");
+  if (ArrayBuffer.isView(data)) return Buffer.from(data.buffer, data.byteOffset, data.byteLength).toString("utf8");
+  if (data && typeof data.text === "function") return data.text();
+  return String(data);
+}
+
+function wsSend(ws, method, params, id) {
+  if (!WS_OK.has(method)) throw new Error(`refusing websocket method ${method}`);
+  ws.send(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
+}
+
+function attachParser(ws) {
+  const waiters = new Map();
+  const taps = [];
+  ws.addEventListener("message", async (event) => {
+    let msg;
+    try {
+      msg = JSON.parse(await asText(event.data));
+    } catch {
+      for (const tap of taps) tap(null);
+      return;
+    }
+    if (msg && msg.id != null && waiters.has(msg.id)) {
+      waiters.get(msg.id)(msg);
+      waiters.delete(msg.id);
+      return;
+    }
+    for (const tap of taps) tap(msg);
+  });
+  return {
+    waitFor(id, timeoutMs) {
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          waiters.delete(id);
+          reject(new Error(`websocket response timeout for id ${id}`));
+        }, timeoutMs);
+        waiters.set(id, (msg) => {
+          clearTimeout(timer);
+          resolve(msg);
+        });
+      });
+    },
+    tap(fn) {
+      taps.push(fn);
+    },
+  };
+}
+
+function waitOpen(ws, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`websocket open timeout ${ws.url}`)), timeoutMs);
+    ws.addEventListener("open", () => {
+      clearTimeout(timer);
+      resolve();
+    }, { once: true });
+    ws.addEventListener("error", () => {
+      clearTimeout(timer);
+      reject(new Error(`websocket error before open ${ws.url}`));
+    }, { once: true });
+  });
+}
+
+async function pollOpenPositions(http, session, pollErrors) {
+  const mints = session.activeOpenMints();
+  for (const mint of mints) {
+    try {
+      const address = bondingCurveAddress(mint);
+      const result = await rpc(http, "getAccountInfo", [
+        address,
+        { encoding: "base64", commitment: "confirmed" },
+      ]);
+      session.observe(mint, decodeBondingCurveAccount(result?.value), Date.now());
+    } catch (err) {
+      pollErrors.push({ mint, message: err.message });
+    }
+  }
+}
+
+function runStream({ ws, parser, subId, http, session, log, durationSec, pollMs }) {
+  const started = Date.now();
+  const deadline = started + durationSec * 1000;
+  const counters = { notifications: 0, tradeEvents: 0, parseErrors: 0, pollErrors: [] };
+  let lastBeat = started;
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (extra) => {
+      if (settled) return;
+      settled = true;
+      clearInterval(pollTimer);
+      clearInterval(deadlineTimer);
+      try {
+        wsSend(ws, "logsUnsubscribe", [subId], 2);
+      } catch {
+        // The socket may already be closed. Unsubscribe is optional.
+      }
+      try {
+        ws.close();
+      } catch {
+        // Already closed.
+      }
+      resolve({ counters, elapsedMs: Date.now() - started, ...extra });
+    };
+
+    const pollTimer = setInterval(() => {
+      pollOpenPositions(http, session, counters.pollErrors).catch((err) => {
+        counters.pollErrors.push({ mint: null, message: err.message });
+      });
+      if (Date.now() - lastBeat >= 30_000) {
+        lastBeat = Date.now();
+        const snap = session.snapshot();
+        log(
+          `[PAPER] heartbeat notifications=${counters.notifications} inBand=${snap.stats.inBand} open=${snap.active.length} modelMarks=${snap.stats.curveMarks} unpriceable=${snap.stats.unpriceable}`,
+        );
+      }
+    }, pollMs);
+
+    const deadlineTimer = setInterval(() => {
+      if (Date.now() >= deadline) finish({ completed: true, disconnect: null });
+    }, 250);
+
+    parser.tap((msg) => {
+      if (!msg || msg.method !== "logsNotification") return;
+      counters.notifications += 1;
+      try {
+        const event = parsePumpLogValue(msg.params?.result?.value);
+        if (!event) return;
+        counters.tradeEvents += 1;
+        const decision = session.trySignal(
+          {
+            mint: event.mint,
+            virtualSolReserves: event.virtualSolReserves,
+            virtualTokenReserves: event.virtualTokenReserves,
+          },
+          Date.now(),
+        );
+        if (decision.reason !== "below_fill" && decision.reason !== "fill_at_or_above_100") {
+          log(
+            `[PAPER] signal mint=${event.mint} fill=${Number(decision.fillPct).toFixed(2)} accepted=${decision.accepted} reason=${decision.reason}`,
+          );
+        }
+      } catch (err) {
+        counters.parseErrors += 1;
+        log(`[PAPER] parse error: ${err.message}`);
+      }
+    });
+
+    ws.addEventListener("close", () => finish({ completed: false, disconnect: "websocket closed" }));
+    ws.addEventListener("error", () => {
+      counters.socketError = "websocket error";
+    });
+  });
+}
+
+async function streamEndpoint({ endpoint, session, log, durationSec, pollMs }) {
+  if (typeof WebSocket !== "function") throw new Error("global WebSocket is unavailable");
+  const slotResult = await rpc(endpoint.http, "getSlot", [{ commitment: "confirmed" }]);
+  const slot = typeof slotResult === "number" ? slotResult : slotResult?.slot ?? slotResult;
+  const ws = new WebSocket(endpoint.ws);
+  const parser = attachParser(ws);
+  try {
+    await waitOpen(ws, 15000);
+    const pending = parser.waitFor(1, 15000);
+    wsSend(ws, "logsSubscribe", [
+      { mentions: [PUMP_PROGRAM.toBase58()] },
+      { commitment: "confirmed" },
+    ], 1);
+    const ack = await pending;
+    if (ack.error) {
+      const message = ack.error.message || JSON.stringify(ack.error);
+      throw new Error(`logsSubscribe rejected by ${endpoint.ws}: ${ack.error.code ?? ""} ${message}`.trim());
+    }
+    if (typeof ack.result !== "number") {
+      throw new Error(`logsSubscribe ack from ${endpoint.ws} had no subscription id`);
+    }
+    log(`[PAPER] subscribed ${endpoint.name} slot=${slot} subscription=${ack.result}`);
+    const streamed = await runStream({
+      ws,
+      parser,
+      subId: ack.result,
+      http: endpoint.http,
+      session,
+      log,
+      durationSec,
+      pollMs,
+    });
+    if (!streamed.completed && streamed.counters.notifications === 0 && streamed.elapsedMs < 15_000) {
+      throw new Error(streamed.disconnect || `socket closed before any logs on ${endpoint.ws}`);
+    }
+    return {
+      name: endpoint.name,
+      http: endpoint.http,
+      ws: endpoint.ws,
+      slot,
+      subscription: ack.result,
+      ...streamed,
+    };
+  } finally {
+    try {
+      ws.close();
+    } catch {
+      // The stream already closes the socket.
+    }
+  }
+}
+
+function publicAttempt(attempt) {
+  return {
+    name: attempt.name,
+    http: attempt.http,
+    ws: attempt.ws,
+    ok: Boolean(attempt.ok),
+    error: attempt.error ?? null,
+    slot: attempt.slot ?? null,
+    subscription: attempt.subscription ?? null,
+    completed: attempt.completed ?? false,
+    disconnect: attempt.disconnect ?? null,
+    elapsedMs: attempt.elapsedMs ?? null,
+    notifications: attempt.counters?.notifications ?? 0,
+    tradeEvents: attempt.counters?.tradeEvents ?? 0,
+    parseErrors: attempt.counters?.parseErrors ?? 0,
+    pollErrorCount: attempt.counters?.pollErrors?.length ?? 0,
+    pollErrors: (attempt.counters?.pollErrors ?? []).slice(0, 20),
+    socketError: attempt.counters?.socketError ?? null,
+  };
+}
+
+export async function runReadOnlySession({ endpoints, durationSec, session, log, pollMs }) {
+  const attempts = [];
+  for (const endpoint of endpoints) {
+    log(`[PAPER] probing ${endpoint.name} http=${endpoint.http} ws=${endpoint.ws}`);
+    try {
+      const used = await streamEndpoint({ endpoint, session, log, durationSec, pollMs });
+      const attempt = publicAttempt({ ...used, ok: true, error: null });
+      attempts.push(attempt);
+      return { ok: true, attempts, used: attempt };
+    } catch (err) {
+      const message = err?.message || String(err);
+      log(`[PAPER] DATA ACCESS FAILED ${endpoint.name}: ${message}`);
+      attempts.push({
+        name: endpoint.name,
+        http: endpoint.http,
+        ws: endpoint.ws,
+        ok: false,
+        error: message,
+      });
+    }
+  }
+  return { ok: false, attempts, used: null };
+}
