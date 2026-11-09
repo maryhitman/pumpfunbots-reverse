@@ -102,6 +102,7 @@ export function evaluateInvocation(argv, env = process.env) {
   let strategy = "modified";
   let compare = false;
   let relayCompare = false;
+  let directCompare = false;
   let earlyExitPassed = false;
   let waitSec = 120;
   let poolFindSec = 180;
@@ -121,6 +122,11 @@ export function evaluateInvocation(argv, env = process.env) {
     }
     if (arg === "--relay-compare") {
       relayCompare = true;
+      continue;
+    }
+    if (arg === "--direct-compare") {
+      relayCompare = true;
+      directCompare = true;
       continue;
     }
     if (!FLAGS_WITH_VALUES.has(arg)) {
@@ -216,6 +222,7 @@ export function evaluateInvocation(argv, env = process.env) {
     strategy: compare ? "compare" : strategy,
     compare,
     relayCompare,
+    directCompare,
     waitSec,
     poolFindSec,
     relayJsonl,

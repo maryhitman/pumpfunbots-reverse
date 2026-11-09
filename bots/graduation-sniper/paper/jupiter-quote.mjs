@@ -1,5 +1,9 @@
 // Read-only Jupiter quote. GET /swap/v1/quote only. Never calls /swap.
 
+import https from "node:https";
+
+const agent = new https.Agent({ keepAlive: true, maxSockets: 8, keepAliveMsecs: 1_000 });
+
 export const JUPITER_QUOTE_ORIGIN = "https://lite-api.jup.ag";
 export const JUPITER_QUOTE_PATH = "/swap/v1/quote";
 export const SOL_OUTPUT_MINT = "So11111111111111111111111111111111111111112";
@@ -69,25 +73,78 @@ export function parseJupiterQuote(body, latencyMs, httpStatus = 200) {
   };
 }
 
+function requestQuote(url) {
+  assertQuoteRequest(url, "GET");
+  const started = Date.now();
+  return new Promise((resolve) => {
+    const req = https.request(url, { method: "GET", agent, timeout: 4_000 }, (res) => {
+      const chunks = [];
+      res.on("data", (chunk) => chunks.push(chunk));
+      res.on("end", () => {
+        const latencyMs = Date.now() - started;
+        let body = null;
+        try {
+          body = JSON.parse(Buffer.concat(chunks).toString("utf8") || "null");
+        } catch {
+          body = null;
+        }
+        const status = res.statusCode || 0;
+        if (status !== 200 && status !== 400) {
+          resolve({ ok: false, venue: "stuck", reason: "jupiter_unreachable", latencyMs, error: `http ${status}` });
+          return;
+        }
+        resolve(parseJupiterQuote(body, latencyMs, status));
+      });
+    });
+    req.on("timeout", () => req.destroy(new Error("timeout")));
+    req.on("error", (err) => {
+      resolve({ ok: false, venue: "stuck", reason: "jupiter_unreachable", latencyMs: Date.now() - started, error: err.message });
+    });
+    req.end();
+  });
+}
+
 export async function fetchJupiterQuote({ inputMint, amount, slippageBps = DEFAULT_SLIPPAGE_BPS }) {
   const url = buildJupiterQuoteUrl({ inputMint, amount: String(amount), slippageBps });
+  return requestQuote(url);
+}
+
+export function hedgedJupiterQuote(args) {
+  const url = buildJupiterQuoteUrl(args);
+  return new Promise((resolve) => {
+    let pending = 2;
+    let fallback = null;
+    const finish = (quote) => {
+      if (quote.ok) {
+        pending = 0;
+        resolve(quote);
+        return;
+      }
+      fallback = quote;
+      pending -= 1;
+      if (pending === 0) resolve(fallback);
+    };
+    requestQuote(url).then(finish);
+    requestQuote(url).then(finish);
+  });
+}
+
+export function startJupiterChase({ inputMint, amount, onResult, timeoutMs = 60_000 }) {
+  let stopped = false;
   const started = Date.now();
-  let response;
-  try {
-    response = await fetch(url, { method: "GET", signal: AbortSignal.timeout(10000) });
-  } catch (err) {
-    return { ok: false, venue: "stuck", reason: "jupiter_unreachable", latencyMs: Date.now() - started, error: err.message };
-  }
-  const latencyMs = Date.now() - started;
-  const text = await response.text();
-  let body = null;
-  try {
-    body = text ? JSON.parse(text) : null;
-  } catch {
-    return { ok: false, venue: "stuck", reason: "jupiter_unreachable", latencyMs, error: `non-json http ${response.status}` };
-  }
-  if (!response.ok && response.status !== 400) {
-    return { ok: false, venue: "stuck", reason: "jupiter_unreachable", latencyMs, error: `http ${response.status}` };
-  }
-  return parseJupiterQuote(body, latencyMs, response.status);
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  (async () => {
+    let delay = 500;
+    while (!stopped && Date.now() - started < timeoutMs) {
+      const quote = await hedgedJupiterQuote({ inputMint, amount: String(amount) });
+      if (stopped) return;
+      const done = onResult(quote);
+      if (quote.ok || done?.stop) return;
+      await sleep(delay);
+      delay = Math.min(1_000, delay + 250);
+    }
+  })();
+  return () => {
+    stopped = true;
+  };
 }

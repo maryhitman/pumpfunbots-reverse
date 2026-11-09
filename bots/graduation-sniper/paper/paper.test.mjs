@@ -114,7 +114,7 @@ test("paper sources have no wallet, sign, or send path", () => {
     }
   }
   assert.deepEqual([...READ_ONLY_HTTP_METHODS], ["getAccountInfo", "getSlot"]);
-  assert.deepEqual([...READ_ONLY_WS_METHODS], ["logsSubscribe", "logsUnsubscribe"]);
+  assert.deepEqual([...READ_ONLY_WS_METHODS], ["logsSubscribe", "logsUnsubscribe", "accountSubscribe", "accountUnsubscribe"]);
   const reader = fs.readFileSync(path.join(paperDir, "public-read.mjs"), "utf8");
   assert.match(reader, /refusing RPC method/);
   assert.match(reader, /refusing websocket method/);
@@ -679,6 +679,64 @@ test("relay handoff, missing pool, and delayed pool stay paper-only", () => {
   assert.throws(() => assertQuoteRequest(new URL("/swap/v1/swap", JUPITER_QUOTE_ORIGIN), "GET"));
   assert.throws(() => assertQuoteRequest(new URL("https://quote-api.jup.ag/swap/v1/quote"), "GET"));
   assert.throws(() => assertQuoteRequest(new URL("/swap/v1/quote", JUPITER_QUOTE_ORIGIN), "POST"));
+});
+
+test("jupiter-direct books the first route, waits through a delay, and zeroes a no-route", () => {
+  const found = createRelayBook({ policy: "jupiter-direct" });
+  found.trySignal({ mint: "jd", ...reserves() }, 0);
+  const hand = found.observe("jd", { complete: true, slot: 8, ...reserves() }, 1_000);
+  assert.equal(hand.reason, "handoff");
+  assert.equal(hand.modelPnlBooked, false);
+  const sold = found.seller.offerJupiter("jd", {
+    ok: true,
+    outAmountLamports: "110000000",
+    priceImpactPct: "1.5",
+    platformFee: { amount: "10", feeBps: 1 },
+    routeFees: [{ label: "Pump.fun Amm", feeAmount: "5", feeMint: "So11111111111111111111111111111111111111112" }],
+    latencyMs: 40,
+    slippageBps: 50,
+    formula: "jupiter-lite-quote-v1-outAmount",
+  }, 1_400);
+  assert.equal(sold.reason, "jupiter_direct_exit");
+  assert.equal(sold.modelMark.venue, "jupiter");
+  assert.equal(sold.modelMark.quoteLatencyMs, 40);
+  assert.equal(sold.modelMark.firstRouteDelayMs, 400);
+  assert.deepEqual(sold.modelMark.routeVenues, ["Pump.fun Amm"]);
+  assert.equal(sold.modelMark.pnlSol, "0.010000000");
+  assert.equal(sold.onChainSell, false);
+  assert.equal(found.report("D").jupiterSells, 1);
+  assert.equal(found.report("D").pumpswapSells, 0);
+
+  const delayed = createRelayBook({ policy: "jupiter-direct" });
+  delayed.trySignal({ mint: "slow", ...reserves() }, 0);
+  delayed.observe("slow", { complete: true, slot: 3, ...reserves() }, 2_000);
+  const waiting = delayed.seller.offerJupiter("slow", { ok: false, reason: "no_route", latencyMs: 20 }, 2_500);
+  assert.equal(waiting.reason, "awaiting_route");
+  assert.equal(waiting.modelPnlBooked, false);
+  const later = delayed.seller.offerJupiter("slow", {
+    ok: true,
+    outAmountLamports: "90000000",
+    priceImpactPct: "0.2",
+    routeFees: [{ label: "Pump.fun Amm", feeAmount: null, feeMint: null }],
+    latencyMs: 55,
+    formula: "jupiter-lite-quote-v1-outAmount",
+  }, 3_200);
+  assert.equal(later.reason, "jupiter_direct_exit");
+  assert.equal(later.modelMark.quoteAttempts, 2);
+  assert.equal(later.modelMark.firstRouteDelayMs, 1_200);
+  assert.equal(later.modelMark.pnlSol, "-0.010000000");
+
+  const none = createRelayBook({ policy: "jupiter-direct" });
+  none.trySignal({ mint: "gone", ...reserves() }, 0);
+  none.observe("gone", { complete: true, slot: 1, ...reserves() }, 10_000);
+  const still = none.seller.offerJupiter("gone", { ok: false, reason: "no_route", latencyMs: 10 }, 20_000);
+  assert.equal(still.reason, "awaiting_route");
+  const stuck = none.seller.offerJupiter("gone", { ok: false, reason: "no_route", latencyMs: 12 }, 70_000);
+  assert.equal(stuck.reason, "mark_to_zero");
+  assert.equal(stuck.modelMark.venue, "stuck");
+  assert.equal(stuck.modelMark.pnlSol, "-0.100000000");
+  assert.equal(none.report("D").stuck, 1);
+  assert.equal(none.report("D").jupiterSells, 0);
 });
 
 function quoteView(userQuoteLamports, slot) {

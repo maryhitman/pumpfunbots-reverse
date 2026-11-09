@@ -20,7 +20,10 @@ export function createSeller({
   stopLoss = STRATEGY_DEFAULTS.stopLossMultiple,
   relay = null,
 } = {}) {
-  if (policy !== "immediate" && policy !== "wait") throw new Error("sell policy must be immediate or wait");
+  if (!["immediate", "wait", "pumpswap-direct", "jupiter-direct"].includes(policy)) {
+    throw new Error("sell policy must be immediate, wait, pumpswap-direct, or jupiter-direct");
+  }
+  const routeTimeoutSec = policy === "jupiter-direct" ? 60 : poolFindTimeoutSec;
   const positions = new Map();
   const closed = [];
   const stats = { accepted: 0, sells: 0, pumpswapSells: 0, jupiterSells: 0, stuck: 0, wins: 0, acks: 0 };
@@ -45,7 +48,8 @@ export function createSeller({
       handoffLatencyMs: nowMs - signal.graduatedAtMs,
       lastQuote: null,
       firstQuoteAtMs: null,
-      status: "seeking_pool",
+      status: policy === "jupiter-direct" ? "seeking_jupiter" : "seeking_pool",
+      quoteAttempts: 0,
     });
     stats.accepted += 1;
     ack(signal, nowMs, "accepted");
@@ -151,7 +155,15 @@ export function createSeller({
       const blocked = poolUsable(position, view);
       if (blocked) {
         position.lastPoolStatus = blocked;
+        if (policy === "jupiter-direct") {
+          results.push({ reason: "jupiter_primary", modelMark: null, modelPnlBooked: false, onChainSell: false });
+          continue;
+        }
         const escalate = quoteFailure.has(blocked) || (ageSec >= poolFindTimeoutSec && position.firstQuoteAtMs == null);
+        if (policy === "pumpswap-direct" && escalate) {
+          results.push(zeroMark(position, nowMs, blocked));
+          continue;
+        }
         if (escalate) {
           position.status = "awaiting_jupiter";
           position.pumpswapFailure = blocked;
@@ -172,7 +184,7 @@ export function createSeller({
       if (position.firstQuoteAtMs == null) position.firstQuoteAtMs = nowMs;
       position.lastQuote = view;
       const multiple = Number(asLamports(view.userQuoteLamports)) / Number(position.spentLamports);
-      if (policy === "immediate") {
+      if (policy === "immediate" || policy === "pumpswap-direct") {
         results.push(quoteMark(position, view, nowMs, "pumpswap_immediate_exit"));
         continue;
       }
@@ -190,6 +202,39 @@ export function createSeller({
       }
       results.push({ reason: "waiting_tp_sl", multiple, modelMark: null, modelPnlBooked: false, onChainSell: false });
     }
+    return results.length === 1 ? results[0] : { reason: "batch", results };
+  }
+
+  function offerJupiter(mint, quote, nowMs) {
+    const owned = [...positions.values()].filter((position) => position.mint === mint && position.status === "seeking_jupiter");
+    if (owned.length === 0) return { reason: "no_position", mint };
+    const results = owned.map((position) => {
+      position.quoteAttempts += 1;
+      const ageSec = (nowMs - position.graduatedAtMs) / 1000;
+      if (quote?.ok && quote.outAmountLamports != null) {
+        if (position.firstRouteAtMs == null) position.firstRouteAtMs = nowMs;
+        return quoteMark(position, {
+          userQuoteLamports: quote.outAmountLamports,
+          formula: quote.formula,
+          slot: quote.contextSlot ?? null,
+        }, nowMs, "jupiter_direct_exit", {
+          venue: "jupiter",
+          quoteLatencyMs: quote.latencyMs ?? null,
+          priceImpactPct: quote.priceImpactPct ?? null,
+          platformFee: quote.platformFee ?? null,
+          routeFees: quote.routeFees ?? [],
+          routeVenues: (quote.routeFees ?? []).map((step) => step.label).filter(Boolean),
+          slippageBps: quote.slippageBps ?? null,
+          graduationDetectedAtMs: position.graduatedAtMs,
+          signalAtMs: position.acceptedAtMs,
+          firstRouteAtMs: position.firstRouteAtMs,
+          firstRouteDelayMs: position.firstRouteAtMs - position.graduatedAtMs,
+          quoteAttempts: position.quoteAttempts,
+        });
+      }
+      if (ageSec >= routeTimeoutSec) return zeroMark(position, nowMs, quote?.reason === "no_route" ? "jupiter_no_route" : "jupiter_timeout");
+      return { reason: "awaiting_route", mint, attempts: position.quoteAttempts, modelMark: null, modelPnlBooked: false, onChainSell: false };
+    });
     return results.length === 1 ? results[0] : { reason: "batch", results };
   }
 
@@ -251,7 +296,7 @@ export function createSeller({
     };
   }
 
-  return { accept, observePool, applyJupiter, settle, snapshot, policy };
+  return { accept, observePool, applyJupiter, offerJupiter, settle, snapshot, policy, routeTimeoutSec };
 }
 
 function publicMark(mark) {

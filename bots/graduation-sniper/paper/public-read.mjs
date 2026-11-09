@@ -11,7 +11,12 @@ import {
 } from "./pumpswap-quote.mjs";
 
 export const READ_ONLY_HTTP_METHODS = Object.freeze(["getAccountInfo", "getSlot"]);
-export const READ_ONLY_WS_METHODS = Object.freeze(["logsSubscribe", "logsUnsubscribe"]);
+export const READ_ONLY_WS_METHODS = Object.freeze([
+  "logsSubscribe",
+  "logsUnsubscribe",
+  "accountSubscribe",
+  "accountUnsubscribe",
+]);
 
 const HTTP_OK = new Set(READ_ONLY_HTTP_METHODS);
 const WS_OK = new Set(READ_ONLY_WS_METHODS);
@@ -200,6 +205,17 @@ async function loadPoolView(http, mint, baseIn) {
   }
 }
 
+function noteCurve(session, mint, outcome, log) {
+  if (outcome.reason === "handoff") {
+    log(`[PAPER] ${session.config.strategy} HANDOFF mint=${mint} graduationDetectedAtMs=${outcome.handoff?.graduatedAtMs} signalAtMs=${outcome.handoff?.graduatedAtMs} slot=${outcome.handoff?.graduationSlot ?? "none"} curveSell=false`);
+    session.onGraduation?.(outcome.handoff, log);
+    return;
+  }
+  if (outcome.reason === "unpriceable" || outcome.reason === "pending_pool" || outcome.modelMark) {
+    log(`[PAPER] ${session.config.strategy} curve mint=${mint} reason=${outcome.reason} missedEarlyExit=${outcome.missedEarlyExit === true} onChainSell=false`);
+  }
+}
+
 function curveStateFromRpc(result) {
   const state = decodeBondingCurveAccount(result?.value);
   if (state == null) return { missing: true, slot: result?.context?.slot };
@@ -219,9 +235,7 @@ async function pollSessions(http, sessions, pollErrors, log) {
       const now = Date.now();
       for (const session of sessions) {
         const outcome = session.observe(mint, state, now);
-        if (outcome.reason === "handoff" || outcome.reason === "unpriceable" || outcome.reason === "pending_pool" || outcome.modelMark) {
-          log(`[PAPER] ${session.config.strategy} curve mint=${mint} reason=${outcome.reason} missedEarlyExit=${outcome.missedEarlyExit === true} onChainSell=false`);
-        }
+        noteCurve(session, mint, outcome, log);
       }
     } catch (err) {
       pollErrors.push({ mint, message: err.message });
@@ -290,7 +304,54 @@ function runStream({ ws, parser, subId, http, sessions, log, durationSec, pollMs
       if (Date.now() >= deadline) finish({ completed: true, disconnect: null });
     }, 250);
 
+    const accountBySub = new Map();
+    const pendingAccount = new Map();
+    const subscribedMint = new Set();
+    let rpcId = 100;
+    const syncAccounts = setInterval(() => {
+      const open = new Set(sessions.flatMap((session) => session.activeOpenMints()));
+      for (const mint of open) {
+        if (subscribedMint.has(mint)) continue;
+        subscribedMint.add(mint);
+        const id = ++rpcId;
+        pendingAccount.set(id, mint);
+        try {
+          wsSend(ws, "accountSubscribe", [
+            bondingCurveAddress(mint),
+            { encoding: "base64", commitment: "processed" },
+          ], id);
+        } catch {
+          subscribedMint.delete(mint);
+        }
+      }
+    }, 500);
+
+    const oldFinish = finish;
+    // The local finish above closes over poll timers. Account sync is cleared there via deadline path
+    // by wrapping the existing finish through clearInterval below when the socket closes.
+    const stopAccounts = () => clearInterval(syncAccounts);
+    ws.addEventListener("close", stopAccounts);
+
     parser.tap((msg) => {
+      if (msg?.id && pendingAccount.has(msg.id)) {
+        const mint = pendingAccount.get(msg.id);
+        if (typeof msg.result === "number") accountBySub.set(msg.result, mint);
+        else subscribedMint.delete(mint);
+        pendingAccount.delete(msg.id);
+        return;
+      }
+      if (msg?.method === "accountNotification") {
+        const mint = accountBySub.get(msg.params?.subscription);
+        if (!mint) return;
+        const value = msg.params?.result?.value;
+        const state = decodeBondingCurveAccount(value) ?? { missing: true };
+        state.slot = msg.params?.result?.context?.slot;
+        const now = Date.now();
+        for (const session of sessions) {
+          noteCurve(session, mint, session.observe(mint, state, now), log);
+        }
+        return;
+      }
       if (!msg || msg.method !== "logsNotification") return;
       counters.notifications += 1;
       try {

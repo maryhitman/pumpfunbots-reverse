@@ -1,5 +1,6 @@
 // One virtual 10 SOL book: curve buyer plus PumpSwap seller joined by the local relay.
 
+import { startJupiterChase } from "./jupiter-quote.mjs";
 import { createPaperSession } from "./engine.mjs";
 import { createRelay } from "./relay.mjs";
 import { createSeller } from "./seller.mjs";
@@ -32,6 +33,23 @@ export function createRelayBook({
     observe: (mint, state, nowMs) => buyer.observe(mint, state, nowMs),
     observePool: (mint, view, nowMs) => seller.observePool(mint, view, nowMs),
     applyJupiter: (mint, quote, nowMs) => seller.applyJupiter(mint, quote, nowMs),
+    onGraduation(signal, log) {
+      if (policy !== "jupiter-direct") return;
+      log?.(`[PAPER] jupiter-direct signal mint=${signal.mint} graduationDetectedAtMs=${signal.graduatedAtMs} signalAtMs=${signal.graduatedAtMs} slot=${signal.graduationSlot ?? "none"}`);
+      startJupiterChase({
+        inputMint: signal.mint,
+        amount: signal.paperTokens,
+        timeoutMs: 60_000,
+        onResult: (quote) => {
+          const outcome = seller.offerJupiter(signal.mint, quote, Date.now());
+          if (outcome.reason !== "awaiting_route") {
+            const venues = (outcome.modelMark?.routeVenues ?? []).join(",") || "none";
+            log?.(`[PAPER] jupiter-direct mint=${signal.mint} venue=${outcome.modelMark?.venue ?? "stuck"} reason=${outcome.reason} firstRouteDelayMs=${outcome.modelMark?.firstRouteDelayMs ?? "none"} quoteLatencyMs=${quote.latencyMs} routes=${venues} outAmount=${quote.outAmountLamports ?? "none"} impact=${quote.priceImpactPct ?? "none"}`);
+          }
+          return outcome.reason === "awaiting_route" ? undefined : { stop: true };
+        },
+      });
+    },
     settle: (nowMs) => seller.settle(nowMs),
     report(label) {
       const buyerSnap = buyer.snapshot();

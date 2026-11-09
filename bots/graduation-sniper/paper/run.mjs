@@ -32,7 +32,11 @@ function bannerLines(review, decision) {
     "Improved curve ledger: repo calcBuyTokens/calcSellSol with truncating 1% fee.",
     "A PumpSwap mark uses the documented sellBaseInput quote only after the pool, vaults, mint, and fee schedule validate. It is not a spot fill.",
   ];
-  if (decision.relayCompare) {
+  if (decision.directCompare) {
+    lines.push("DIRECT COMPARE: A exit-at-97, B PumpSwap-direct immediate, D Jupiter-direct immediate. Each starts at 10 virtual SOL.");
+    lines.push("D quotes Jupiter as soon as the graduation handoff arrives, retries about every 0.5-1s with two keep-alive requests, and books the first route. No route within 60s is stuck and marked to zero.");
+    lines.push("Paper quotes ignore landing delay and execution slippage. The swap endpoint is not called.");
+  } else if (decision.relayCompare) {
     lines.push("RELAY COMPARE: three paper books, each starting at 10 virtual SOL. Entry is fill >= 92% and fill < 100%.");
     lines.push("A exit-at-97 sells on the curve only while complete=false and fill is in [97, 100).");
     lines.push("B and C are two-bot relays. The curve buyer keeps stop-loss, take-profit, and timeout before graduation and does not sell on graduation. It emits a handoff.");
@@ -166,6 +170,7 @@ function relayAdapter(book, label) {
     observe: book.observe,
     observePool: book.observePool,
     applyJupiter: book.applyJupiter,
+    onGraduation: book.onGraduation,
     activeOpenMints: () => book.buyer.activeOpenMints(),
     pendingPoolMints: () => book.seller.snapshot().open.map((row) => row.mint),
     simulatedTokens(mint) {
@@ -206,15 +211,27 @@ async function main() {
   if (decision.relayCompare) {
     const relayDir = path.resolve(decision.relayJsonl ? path.dirname(decision.relayJsonl) : path.join(here, "..", "..", "..", "paper-runs", "relay"));
     fs.mkdirSync(relayDir, { recursive: true });
-    relayBooks.push(
-      createRelayBook({ policy: "immediate", poolFindTimeoutSec: decision.poolFindSec, jsonlPath: path.join(relayDir, "immediate.jsonl") }),
-      createRelayBook({ policy: "wait", waitSec: decision.waitSec, poolFindTimeoutSec: decision.poolFindSec, jsonlPath: path.join(relayDir, "wait.jsonl") }),
-    );
-    sessions = [
-      createPaperSession({ strategy: "exit-at-97", earlyExitFillPct: decision.earlyExitFillPct }),
-      relayAdapter(relayBooks[0], "relay-immediate"),
-      relayAdapter(relayBooks[1], "relay-wait"),
-    ];
+    if (decision.directCompare) {
+      relayBooks.push(
+        createRelayBook({ policy: "pumpswap-direct", poolFindTimeoutSec: decision.poolFindSec, jsonlPath: path.join(relayDir, "pumpswap-direct.jsonl") }),
+        createRelayBook({ policy: "jupiter-direct", jsonlPath: path.join(relayDir, "jupiter-direct.jsonl") }),
+      );
+      sessions = [
+        createPaperSession({ strategy: "exit-at-97", earlyExitFillPct: decision.earlyExitFillPct }),
+        relayAdapter(relayBooks[0], "pumpswap-direct"),
+        relayAdapter(relayBooks[1], "jupiter-direct"),
+      ];
+    } else {
+      relayBooks.push(
+        createRelayBook({ policy: "immediate", poolFindTimeoutSec: decision.poolFindSec, jsonlPath: path.join(relayDir, "immediate.jsonl") }),
+        createRelayBook({ policy: "wait", waitSec: decision.waitSec, poolFindTimeoutSec: decision.poolFindSec, jsonlPath: path.join(relayDir, "wait.jsonl") }),
+      );
+      sessions = [
+        createPaperSession({ strategy: "exit-at-97", earlyExitFillPct: decision.earlyExitFillPct }),
+        relayAdapter(relayBooks[0], "relay-immediate"),
+        relayAdapter(relayBooks[1], "relay-wait"),
+      ];
+    }
   } else {
     sessions = comparison
       ? [comparison.pre, comparison.post]
@@ -298,8 +315,12 @@ async function main() {
     }
   }
   const books = sessions.map((session) => session.snapshot());
-  const relayReports = decision.relayCompare
-    ? [null, relayBooks[0].report("B-relay-immediate"), relayBooks[1].report("C-relay-wait")]
+    const relayReports = decision.relayCompare
+    ? [
+      null,
+      relayBooks[0].report(decision.directCompare ? "B-pumpswap-direct" : "B-relay-immediate"),
+      relayBooks[1].report(decision.directCompare ? "D-jupiter-direct" : "C-relay-wait"),
+    ]
     : null;
   for (const snapshot of books) {
     for (const line of summaryLines(snapshot)) log(line);
