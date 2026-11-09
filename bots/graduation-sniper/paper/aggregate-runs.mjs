@@ -15,16 +15,19 @@ function rowsFromBook(book) {
 function rowsFromJsonl(file, minAtMs = 0) {
   if (!file || !fs.existsSync(file)) return [];
   const out = [];
+  const handoffs = new Map();
   for (const line of fs.readFileSync(file, "utf8").split("\n")) {
     if (!line) continue;
     const row = JSON.parse(line);
+    if (row.type === "handoff" && Number.isInteger(row.graduatedAtMs)) handoffs.set(row.id, row);
     if (row.type !== "result" || !Number.isInteger(row.atMs) || row.atMs < Math.max(1_000_000_000_000, minAtMs)) continue;
+    const handoff = handoffs.get(row.id);
     out.push({
       mint: row.mint,
       venue: row.venue,
       trigger: row.trigger,
       pnlLamports: row.pnlLamports,
-      graduationToFirstRouteMs: null,
+      graduationToFirstRouteMs: handoff ? row.atMs - handoff.graduatedAtMs : null,
       quoteLatencyMs: null,
       graduationToSignalMs: 0,
     });
@@ -143,6 +146,8 @@ export function aggregate(runs) {
         stuck: sample.stuck,
         wins: sample.wins,
         terminal: sample.terminal,
+        openLeft: sample.openLeft,
+        seeking: sample.seeking,
         winRate: sample.terminal === 0 ? null : sample.wins / sample.terminal,
         pnlSol: sample.pnlSol,
         pnlExcludingBiggestSol: lamportsToSolString(BigInt(sample.pnlExcludingBiggestLamports)),
