@@ -81,6 +81,21 @@ export function createRelayBook({
         winRate: terminal === 0 ? null : wins / terminal,
         terminal,
         onChainSells: 0,
+        curveRows: buyerSnap.closed.map((position) => ({
+          mint: position.mint,
+          venue: "curve",
+          trigger: position.modelMark?.trigger ?? null,
+          pnlLamports: position.modelMark?.improved?.pnl?.lamports ?? "0",
+        })),
+        sells: sellerSnap.closed.map((row) => ({
+          mint: row.mint,
+          venue: row.modelMark?.venue ?? null,
+          trigger: row.modelMark?.trigger ?? null,
+          pnlLamports: row.modelMark?.pnlLamports ?? "0",
+          graduationToSignalMs: row.handoffLatencyMs,
+          graduationToFirstRouteMs: row.modelMark?.firstRouteDelayMs ?? row.modelMark?.poolFoundLatencyMs ?? null,
+          quoteLatencyMs: row.modelMark?.quoteLatencyMs ?? null,
+        })),
         buyer: buyerSnap,
         seller: sellerSnap,
       };

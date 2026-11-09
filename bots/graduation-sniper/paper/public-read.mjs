@@ -254,7 +254,8 @@ async function pollSessions(http, sessions, pollErrors, log) {
       }
       if (outcome.reason !== "not_pending" && outcome.reason !== "no_position" && outcome.reason !== "seeking_pool") {
         const pnl = outcome.modelMark?.pnlSol ?? outcome.modelMark?.improved?.pnl?.sol ?? "none";
-        log(`[PAPER] ${session.config.strategy} pool mint=${mint} reason=${outcome.reason} venue=${outcome.modelMark?.venue ?? outcome.poolStatus ?? "seeking"} quoteLatencyMs=${outcome.modelMark?.quoteLatencyMs ?? "none"} modelPnl=${pnl}`);
+        const routeMs = outcome.modelMark?.firstRouteDelayMs ?? outcome.modelMark?.poolFoundLatencyMs ?? "none";
+        log(`[PAPER] ${session.config.strategy} pool mint=${mint} reason=${outcome.reason} venue=${outcome.modelMark?.venue ?? outcome.poolStatus ?? "seeking"} graduationToSignalMs=${outcome.modelMark?.handoffLatencyMs ?? "none"} graduationToRouteMs=${routeMs} quoteLatencyMs=${outcome.modelMark?.quoteLatencyMs ?? "none"} modelPnl=${pnl}`);
       }
     }
   }
