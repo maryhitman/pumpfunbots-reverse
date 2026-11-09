@@ -12,13 +12,13 @@ function rowsFromBook(book) {
   }));
 }
 
-function rowsFromJsonl(file) {
+function rowsFromJsonl(file, minAtMs = 0) {
   if (!file || !fs.existsSync(file)) return [];
   const out = [];
   for (const line of fs.readFileSync(file, "utf8").split("\n")) {
     if (!line) continue;
     const row = JSON.parse(line);
-    if (row.type !== "result" || !Number.isInteger(row.atMs) || row.atMs < 1_000_000_000_000) continue;
+    if (row.type !== "result" || !Number.isInteger(row.atMs) || row.atMs < Math.max(1_000_000_000_000, minAtMs)) continue;
     out.push({
       mint: row.mint,
       venue: row.venue,
@@ -48,7 +48,7 @@ export function loadRun(spec) {
     const curveRows = i === 0
       ? rowsFromBook(item.source)
       : (item.relay?.curveRows ?? rowsFromBook(item.source));
-    const sells = i === 0 ? [] : (item.relay?.sells ?? rowsFromJsonl(spec.sellJsonl?.[i - 1]));
+    const sells = i === 0 ? [] : (item.relay?.sells ?? rowsFromJsonl(spec.sellJsonl?.[i - 1], spec.minAtMs ?? 0));
     const rows = [...curveRows, ...sells];
     const pnl = rows.reduce((sum, row) => sum + BigInt(row.pnlLamports || 0), 0n);
     const wins = rows.filter((row) => BigInt(row.pnlLamports || 0) > 0n).length;
