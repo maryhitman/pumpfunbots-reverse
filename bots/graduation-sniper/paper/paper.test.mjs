@@ -11,6 +11,7 @@ import { PAPER_ASSUMPTIONS, PUMP_PROGRAM_ID, STRATEGY_DEFAULTS, solToLamports } 
 import { assertLedgerConserved, createComparison, createPaperSession, virtualSolFillPct } from "./engine.mjs";
 import { createRelayBook } from "./relay-book.mjs";
 import { readRelay } from "./relay.mjs";
+import { assertQuoteRequest, parseJupiterQuote, JUPITER_QUOTE_ORIGIN } from "./jupiter-quote.mjs";
 import {
   FEE_CONFIG_DISC,
   GLOBAL_CONFIG_DISC,
@@ -600,9 +601,11 @@ test("relay handoff, missing pool, and delayed pool stay paper-only", () => {
   const missing = book.observePool("late", { status: "missing_pool", validated: false, slot: 51 }, 50_000);
   assert.equal(missing.reason, "seeking_pool");
   assert.equal(missing.modelPnlBooked, false);
-  const stuck = book.observePool("late", { status: "missing_pool", validated: false, slot: 80 }, 41_000 + 180_000);
-  assert.equal(stuck.reason, "mark_to_zero");
+  const needs = book.observePool("late", { status: "missing_pool", validated: false, slot: 80 }, 41_000 + 180_000);
+  assert.equal(needs.reason, "needs_jupiter");
+  const stuck = book.applyJupiter("late", { ok: false, reason: "no_route", latencyMs: 25 }, 41_000 + 180_000);
   assert.equal(stuck.modelMark.markToZero, true);
+  assert.equal(stuck.modelMark.venue, "stuck");
   assert.equal(stuck.modelMark.pnlSol, "-0.100000000");
   assert.equal(stuck.onChainSell, false);
   assert.equal(book.report("B").stuck, 1);
@@ -641,6 +644,41 @@ test("relay handoff, missing pool, and delayed pool stay paper-only", () => {
   assert.equal(tp.onChainSell, false);
   assertLedgerConserved(book.buyer.snapshot());
   assertLedgerConserved(delayed.buyer.snapshot());
+
+  const fallback = createRelayBook({ policy: "immediate", poolFindTimeoutSec: 30 });
+  fallback.trySignal({ mint: "Fb1111111111111111111111111111111111111111", ...reserves() }, 0);
+  fallback.observe("Fb1111111111111111111111111111111111111111", { complete: true, slot: 2, ...reserves() }, 1_000);
+  assert.equal(fallback.observePool("Fb1111111111111111111111111111111111111111", { status: "missing_pool", validated: false, slot: 3 }, 40_000).reason, "needs_jupiter");
+  const viaJupiter = fallback.applyJupiter("Fb1111111111111111111111111111111111111111", {
+    ok: true,
+    outAmountLamports: "125000000",
+    priceImpactPct: "0.12",
+    platformFee: { amount: "1000", feeBps: 1 },
+    routeFees: [{ label: "Pump", feeAmount: "20", feeMint: "So11111111111111111111111111111111111111112" }],
+    latencyMs: 80,
+    slippageBps: 50,
+    formula: "jupiter-lite-quote-v1-outAmount",
+  }, 41_000);
+  assert.equal(viaJupiter.reason, "jupiter_immediate_exit");
+  assert.equal(viaJupiter.modelMark.venue, "jupiter");
+  assert.equal(viaJupiter.modelMark.quoteLatencyMs, 80);
+  assert.equal(viaJupiter.modelMark.priceImpactPct, "0.12");
+  assert.equal(viaJupiter.modelMark.pnlSol, "0.025000000");
+  assert.equal(viaJupiter.onChainSell, false);
+  assert.equal(fallback.report("B").jupiterSells, 1);
+  assert.equal(fallback.report("B").pumpswapSells, 0);
+
+  const none = createRelayBook({ policy: "immediate", poolFindTimeoutSec: 30 });
+  none.trySignal({ mint: "none", ...reserves() }, 0);
+  none.observe("none", { complete: true, slot: 4, ...reserves() }, 1_000);
+  none.observePool("none", { status: "zero_liquidity", validated: false, slot: 5 }, 2_000);
+  const noRoute = none.applyJupiter("none", parseJupiterQuote({ error: "No routes found", errorCode: "NO_ROUTES_FOUND" }, 15, 400), 2_100);
+  assert.equal(noRoute.reason, "mark_to_zero");
+  assert.equal(noRoute.modelMark.venue, "stuck");
+  assert.equal(noRoute.modelMark.reason, "jupiter_no_route");
+  assert.throws(() => assertQuoteRequest(new URL("/swap/v1/swap", JUPITER_QUOTE_ORIGIN), "GET"));
+  assert.throws(() => assertQuoteRequest(new URL("https://quote-api.jup.ag/swap/v1/quote"), "GET"));
+  assert.throws(() => assertQuoteRequest(new URL("/swap/v1/quote", JUPITER_QUOTE_ORIGIN), "POST"));
 });
 
 function quoteView(userQuoteLamports, slot) {

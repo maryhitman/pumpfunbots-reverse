@@ -31,6 +31,7 @@ export function createRelayBook({
     trySignal: (signal, nowMs) => buyer.trySignal(signal, nowMs),
     observe: (mint, state, nowMs) => buyer.observe(mint, state, nowMs),
     observePool: (mint, view, nowMs) => seller.observePool(mint, view, nowMs),
+    applyJupiter: (mint, quote, nowMs) => seller.applyJupiter(mint, quote, nowMs),
     settle: (nowMs) => seller.settle(nowMs),
     report(label) {
       const buyerSnap = buyer.snapshot();
@@ -50,7 +51,8 @@ export function createRelayBook({
         curveCloses: buyerSnap.stats.curveMarks,
         graduationsCaptured: buyerSnap.stats.handoffs,
         handoffs: sellerSnap.stats.accepted,
-        pumpswapSells: sellerSnap.stats.sells,
+        pumpswapSells: sellerSnap.stats.pumpswapSells,
+        jupiterSells: sellerSnap.stats.jupiterSells,
         stuck: sellerSnap.stats.stuck,
         openOnCurve: buyerSnap.active.filter((position) => position.status === "open").length,
         seekingPool: sellerSnap.open.length,

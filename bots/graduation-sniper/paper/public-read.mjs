@@ -1,6 +1,7 @@
 import { PublicKey } from "@solana/web3.js";
 import { PUMP_PROGRAM } from "../../../lib/constants.mjs";
 import { parsePumpLogValue } from "./parse-log.mjs";
+import { fetchJupiterQuote } from "./jupiter-quote.mjs";
 import {
   assessPoolAccounts,
   canonicalPoolAddress,
@@ -232,9 +233,14 @@ async function pollSessions(http, sessions, pollErrors, log) {
       const baseIn = session.simulatedTokens(mint);
       if (baseIn == null) continue;
       const view = await loadPoolView(http, mint, baseIn);
-      const outcome = session.observePool(mint, view, Date.now());
-      if (outcome.reason !== "not_pending" && outcome.reason !== "no_position") {
-        log(`[PAPER] ${session.config.strategy} pool mint=${mint} reason=${outcome.reason} poolStatus=${outcome.poolStatus ?? "executable"} modelPnl=${outcome.modelMark ? outcome.modelMark.improved.pnl.sol : "none"}`);
+      let outcome = session.observePool(mint, view, Date.now());
+      if (outcome.reason === "needs_jupiter" && typeof session.applyJupiter === "function") {
+        const quote = await fetchJupiterQuote({ inputMint: mint, amount: baseIn });
+        outcome = session.applyJupiter(mint, quote, Date.now());
+      }
+      if (outcome.reason !== "not_pending" && outcome.reason !== "no_position" && outcome.reason !== "seeking_pool") {
+        const pnl = outcome.modelMark?.pnlSol ?? outcome.modelMark?.improved?.pnl?.sol ?? "none";
+        log(`[PAPER] ${session.config.strategy} pool mint=${mint} reason=${outcome.reason} venue=${outcome.modelMark?.venue ?? outcome.poolStatus ?? "seeking"} quoteLatencyMs=${outcome.modelMark?.quoteLatencyMs ?? "none"} modelPnl=${pnl}`);
       }
     }
   }

@@ -165,6 +165,7 @@ function relayAdapter(book, label) {
     trySignal: book.trySignal,
     observe: book.observe,
     observePool: book.observePool,
+    applyJupiter: book.applyJupiter,
     activeOpenMints: () => book.buyer.activeOpenMints(),
     pendingPoolMints: () => book.seller.snapshot().open.map((row) => row.mint),
     simulatedTokens(mint) {
@@ -285,7 +286,16 @@ async function main() {
   }
 
   if (decision.relayCompare && decision.mode !== "fixture") {
-    for (const book of relayBooks) book.settle(Date.now());
+    const { fetchJupiterQuote } = await import("./jupiter-quote.mjs");
+    for (const book of relayBooks) {
+      for (const row of book.seller.snapshot().open) {
+        if (row.modelMark) continue;
+        const quote = await fetchJupiterQuote({ inputMint: row.mint, amount: row.paperTokens });
+        book.applyJupiter(row.mint, quote, Date.now());
+        log(`[PAPER] ${book.policy} jupiter mint=${row.mint} ok=${quote.ok} reason=${quote.reason ?? "quoted"} latencyMs=${quote.latencyMs}`);
+      }
+      book.settle(Date.now());
+    }
   }
   const books = sessions.map((session) => session.snapshot());
   const relayReports = decision.relayCompare

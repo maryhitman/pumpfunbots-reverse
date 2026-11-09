@@ -59,7 +59,7 @@ Entry, size, and risk limits stay on the original `graduation.mjs` numbers. The 
 
 `--strategy modified` is the single book that also refuses new entries at or above 97%. `--strategy original` is the comparison baseline: entry under 100%, no 97% exit, and no PumpSwap quote. `--duration-sec` is an integer from 1 to 660, or up to 10800 with `--relay-compare`.
 
-`--relay-compare` adds the two-bot path. The curve buyer still uses stop-loss, take-profit, and timeout before graduation, and on graduation it writes a handoff instead of a curve sell. Book B sells on the first validated PumpSwap quote. Book C waits up to `--wait-sec` (default 120) for a 1.5x or 0.7x fee-adjusted PumpSwap result, then sells the last quote. If the pool never validates, the position is stuck and marked to zero proceeds. That write-off is not a fill.
+`--relay-compare` adds the two-bot path. The curve buyer still uses stop-loss, take-profit, and timeout before graduation, and on graduation it writes a handoff instead of a curve sell. Book B sells on the first validated PumpSwap quote. Book C waits up to `--wait-sec` (default 120) for a 1.5x or 0.7x fee-adjusted PumpSwap result, then sells the last quote. If the pool never validates, or the PumpSwap quote fails, the seller requests a read-only Jupiter quote from `https://lite-api.jup.ag/swap/v1/quote` (GET only, output mint wrapped SOL, 50 bps slippage). The paper sell uses that quote's `outAmount`, route fees, platform fee, and price impact. The swap endpoint is refused. Only a Jupiter no-route, after the PumpSwap failure, is a stuck mark-to-zero.
 
 Separate processes use the same JSONL relay:
 

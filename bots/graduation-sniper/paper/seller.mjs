@@ -23,7 +23,7 @@ export function createSeller({
   if (policy !== "immediate" && policy !== "wait") throw new Error("sell policy must be immediate or wait");
   const positions = new Map();
   const closed = [];
-  const stats = { accepted: 0, sells: 0, stuck: 0, wins: 0, acks: 0 };
+  const stats = { accepted: 0, sells: 0, pumpswapSells: 0, jupiterSells: 0, stuck: 0, wins: 0, acks: 0 };
 
   function ack(signal, nowMs, status) {
     stats.acks += 1;
@@ -59,12 +59,17 @@ export function createSeller({
     closed.push(position);
     const pnl = mark.pnlLamports;
     if (pnl > 0n) stats.wins += 1;
-    if (mark.trigger === "mark_to_zero") stats.stuck += 1;
-    else stats.sells += 1;
+    if (mark.venue === "stuck") stats.stuck += 1;
+    else {
+      stats.sells += 1;
+      if (mark.venue === "jupiter") stats.jupiterSells += 1;
+      else stats.pumpswapSells += 1;
+    }
     relay?.logResult({
       id: position.id,
       mint: position.mint,
       trigger: mark.trigger,
+      venue: mark.venue,
       pnlLamports: pnl.toString(),
       atMs: mark.atMs,
     });
@@ -78,7 +83,7 @@ export function createSeller({
     };
   }
 
-  function quoteMark(position, view, nowMs, trigger) {
+  function quoteMark(position, view, nowMs, trigger, extra = {}) {
     const proceeds = asLamports(view.userQuoteLamports);
     return terminal(position, {
       trigger,
@@ -90,12 +95,15 @@ export function createSeller({
         protocolFeeLamports: view.protocolFeeLamports?.toString?.() ?? null,
         creatorFeeLamports: view.creatorFeeLamports?.toString?.() ?? null,
       },
+      venue: "pumpswap",
       formula: view.formula ?? "pump-swap-sdk-2.2.0 sellBaseInput",
-      poolFoundLatencyMs: position.firstQuoteAtMs - position.graduatedAtMs,
+      poolFoundLatencyMs: position.firstQuoteAtMs == null ? null : position.firstQuoteAtMs - position.graduatedAtMs,
+      quoteLatencyMs: null,
       handoffLatencyMs: position.handoffLatencyMs,
       slot: view.slot ?? null,
       priced: true,
       markToZero: false,
+      ...extra,
     });
   }
 
@@ -108,11 +116,21 @@ export function createSeller({
       reason: why,
       poolFoundLatencyMs: null,
       handoffLatencyMs: position.handoffLatencyMs,
+      venue: "stuck",
       priced: false,
       markToZero: true,
       formula: null,
+      quoteLatencyMs: null,
     });
   }
+
+  const quoteFailure = new Set([
+    "zero_liquidity",
+    "insufficient_real_reserves",
+    "fee_unverified",
+    "layout_short",
+    "transfer_fee_unverified",
+  ]);
 
   function poolUsable(position, view) {
     if (!view || view.validated !== true || view.status !== "executable" || view.userQuoteLamports == null) {
@@ -133,8 +151,19 @@ export function createSeller({
       const blocked = poolUsable(position, view);
       if (blocked) {
         position.lastPoolStatus = blocked;
-        if (ageSec >= poolFindTimeoutSec && position.firstQuoteAtMs == null) {
-          results.push(zeroMark(position, nowMs, blocked));
+        const escalate = quoteFailure.has(blocked) || (ageSec >= poolFindTimeoutSec && position.firstQuoteAtMs == null);
+        if (escalate) {
+          position.status = "awaiting_jupiter";
+          position.pumpswapFailure = blocked;
+          results.push({
+            reason: "needs_jupiter",
+            poolStatus: blocked,
+            mint: position.mint,
+            paperTokens: position.paperTokens.toString(),
+            modelMark: null,
+            modelPnlBooked: false,
+            onChainSell: false,
+          });
         } else {
           results.push({ reason: "seeking_pool", poolStatus: blocked, modelMark: null, modelPnlBooked: false, onChainSell: false });
         }
@@ -164,6 +193,33 @@ export function createSeller({
     return results.length === 1 ? results[0] : { reason: "batch", results };
   }
 
+  function applyJupiter(mint, quote, nowMs) {
+    const owned = [...positions.values()].filter((position) => position.mint === mint && position.firstQuoteAtMs == null);
+    if (owned.length === 0) return { reason: "no_position", mint };
+    const results = owned.map((position) => {
+      position.jupiterLatencyMs = quote?.latencyMs ?? null;
+      if (quote?.ok && quote.outAmountLamports != null) {
+        return quoteMark(position, {
+          userQuoteLamports: quote.outAmountLamports,
+          formula: quote.formula,
+          slot: quote.contextSlot ?? null,
+        }, nowMs, policy === "immediate" ? "jupiter_immediate_exit" : "jupiter_quote_exit", {
+          venue: "jupiter",
+          quoteLatencyMs: quote.latencyMs ?? null,
+          priceImpactPct: quote.priceImpactPct ?? null,
+          platformFee: quote.platformFee ?? null,
+          routeFees: quote.routeFees ?? [],
+          slippageBps: quote.slippageBps ?? null,
+          otherAmountThreshold: quote.otherAmountThreshold ?? null,
+        });
+      }
+      if (quote?.reason === "no_route") return zeroMark(position, nowMs, "jupiter_no_route");
+      position.lastJupiterError = quote?.reason || "jupiter_unreachable";
+      return { reason: "jupiter_retry", mint, poolStatus: position.lastJupiterError, modelMark: null, modelPnlBooked: false, onChainSell: false };
+    });
+    return results.length === 1 ? results[0] : { reason: "batch", results };
+  }
+
   function settle(nowMs) {
     const left = [...positions.values()];
     const results = [];
@@ -173,7 +229,7 @@ export function createSeller({
       } else if (position.lastQuote && policy === "immediate") {
         results.push(quoteMark(position, position.lastQuote, nowMs, "pumpswap_immediate_exit"));
       } else {
-        results.push(zeroMark(position, nowMs, "session_ended_without_executable_pool"));
+        results.push(zeroMark(position, nowMs, position.lastJupiterError === "no_route" ? "jupiter_no_route" : "session_ended_without_executable_pool"));
       }
     }
     return results;
@@ -195,7 +251,7 @@ export function createSeller({
     };
   }
 
-  return { accept, observePool, settle, snapshot, policy };
+  return { accept, observePool, applyJupiter, settle, snapshot, policy };
 }
 
 function publicMark(mark) {
