@@ -681,6 +681,39 @@ test("relay handoff, missing pool, and delayed pool stay paper-only", () => {
   assert.throws(() => assertQuoteRequest(new URL("/swap/v1/quote", JUPITER_QUOTE_ORIGIN), "POST"));
 });
 
+test("QPZhp paper tokens stay raw curve units and the 65 SOL print is the pool price", () => {
+  const entrySol = 79_562_375_178n;
+  const entryTokens = 404_588_223_128_045n;
+  const bought = quoteBuy(entrySol, entryTokens, 100_000_000n);
+  assert.equal(bought.tokens, 502_806_209_410n);
+  const curve = quoteSell(entrySol, entryTokens, bought.tokens);
+  assert.equal(curve.proceedsLamports, 97_766_696n);
+  const poolAtQuoteSlot = sellBaseQuote({
+    baseIn: bought.tokens,
+    baseReserve: 11_433_944_434_671n,
+    quoteReserve: 1_523_245_194_491n,
+    virtualQuoteReserves: 17_584_505_289n,
+    feeBuckets: 0n,
+    lpFeeBps: 0n,
+    protocolFeeBps: 0n,
+    creatorFeeBps: 0n,
+    coinCreatorIsDefault: true,
+  });
+  assert.equal(poolAtQuoteSlot.userQuote, 64_903_654_586n);
+  const dividedByDecimals = sellBaseQuote({
+    baseIn: bought.tokens / 1_000_000n,
+    baseReserve: 11_433_944_434_671n,
+    quoteReserve: 1_523_245_194_491n,
+    virtualQuoteReserves: 17_584_505_289n,
+    feeBuckets: 0n,
+    lpFeeBps: 0n,
+    protocolFeeBps: 0n,
+    creatorFeeBps: 0n,
+    coinCreatorIsDefault: true,
+  });
+  assert.equal(dividedByDecimals.userQuote, 67_757n);
+});
+
 test("jupiter-direct books the first route, waits through a delay, and zeroes a no-route", () => {
   const found = createRelayBook({ policy: "jupiter-direct" });
   found.trySignal({ mint: "jd", ...reserves() }, 0);
