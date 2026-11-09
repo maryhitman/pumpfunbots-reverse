@@ -6,6 +6,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { ASSUMPTION_LINES, LIMITATION_LINES, PAPER_ASSUMPTIONS } from "./defaults.mjs";
 import { assertLedgerConserved, createComparison, createPaperSession } from "./engine.mjs";
+import { createRelayBook } from "./relay-book.mjs";
 import { evaluateInvocation } from "./guard.mjs";
 import { replayFixture } from "./replay.mjs";
 import { analyzeGraduationSource, analyzePumpfunFormula } from "./review-source.mjs";
@@ -31,7 +32,14 @@ function bannerLines(review, decision) {
     "Improved curve ledger: repo calcBuyTokens/calcSellSol with truncating 1% fee.",
     "A PumpSwap mark uses the documented sellBaseInput quote only after the pool, vaults, mint, and fee schedule validate. It is not a spot fill.",
   ];
-  if (decision.compare) {
+  if (decision.relayCompare) {
+    lines.push("RELAY COMPARE: three paper books, each starting at 10 virtual SOL. Entry is fill >= 92% and fill < 100%.");
+    lines.push("A exit-at-97 sells on the curve only while complete=false and fill is in [97, 100).");
+    lines.push("B and C are two-bot relays. The curve buyer keeps stop-loss, take-profit, and timeout before graduation and does not sell on graduation. It emits a handoff.");
+    lines.push(`B seller policy: immediate paper sell on the first validated PumpSwap quote. Pool search gives up after ${decision.poolFindSec}s and marks the position stuck at zero proceeds.`);
+    lines.push(`C seller policy: after the first quote, wait up to ${decision.waitSec}s for a 1.5x take-profit or 0.7x stop-loss on the fee-adjusted PumpSwap proceeds. Otherwise sell the last quote. No quote becomes a stuck mark-to-zero.`);
+    lines.push("A mark-to-zero is a modeled write-off of the cost basis, not a pool fill and not a real sale.");
+  } else if (decision.compare) {
     lines.push(`COMPARE: two modified books on the same events. Each starts at 10 virtual SOL. Entry band is the original >=92% and <100%.`);
     lines.push(`A exit-at-97: attempt a curve exit when a read shows complete=false and fill >= ${decision.earlyExitFillPct}% and fill < 100%. The mark uses that observed state, not a backfilled ${decision.earlyExitFillPct}% price. A read at or above 100% fill, or a graduated, missing, or unreadable read, is not a 97% sale. Missed exits keep cash reserved.`);
     lines.push("B pumpswap-immediate: hold through graduation. The primary rule is the first validated PumpSwap pool quote after that observation. Migration does not imply liquidity or a price. Missing, unverified, stale, zero-liquidity, or rate-limited reads stay pending or become a missed exit with no booked profit.");
@@ -59,8 +67,14 @@ function decisionLine(prefix, result) {
   if (result.reason === "unpriceable" || result.reason === "already_unpriceable" || result.reason === "missed_exit") {
     return `${prefix} UNPRICEABLE mint=${result.mint} reason=${result.unpriceableReason ?? result.reason} missedEarlyExit=${result.missedEarlyExit === true} modelPnl=none slotLocked=true onChainSell=false`;
   }
-  if (result.reason === "pending_pool") {
-    return `${prefix} PENDING POOL mint=${result.mint} status=${result.poolStatus ?? "waiting"} modelPnl=none cashReserved=true`;
+  if (result.reason === "pending_pool" || result.reason === "seeking_pool") {
+    return `${prefix} PENDING POOL mint=${result.mint} status=${result.poolStatus ?? "waiting"} modelPnl=none`;
+  }
+  if (result.reason === "handoff") {
+    return `${prefix} HANDOFF mint=${result.handoff.mint} tokens=${result.handoff.paperTokens} slot=${result.handoff.graduationSlot ?? "none"} curveSell=false`;
+  }
+  if (result.reason === "mark_to_zero") {
+    return `${prefix} STUCK mark-to-zero pnl=${result.modelMark.pnlSol} SOL. This is a write-off, not a pool fill.`;
   }
   if (result.modelMark) {
     const mark = result.modelMark;
@@ -99,9 +113,10 @@ function summaryLines(snapshot) {
   return lines;
 }
 
-function buildReport({ mode, decision, review, snapshot, books, data, comparisonVerdict }) {
+function buildReport({ mode, decision, review, snapshot, books, data, comparisonVerdict, relayReports }) {
   return {
     comparisonVerdict,
+    relayReports: (relayReports ?? []).filter(Boolean).map(({ buyer, seller, ...rest }) => rest),
     program: "graduation-sniper-paper",
     mode: "paper-only",
     failClosed: true,
@@ -144,6 +159,29 @@ function writeOutputs(decision, report, lines) {
   return { jsonOut, logOut };
 }
 
+function relayAdapter(book, label) {
+  return {
+    config: { ...book.buyer.config, strategy: label },
+    trySignal: book.trySignal,
+    observe: book.observe,
+    observePool: book.observePool,
+    activeOpenMints: () => book.buyer.activeOpenMints(),
+    pendingPoolMints: () => book.seller.snapshot().open.map((row) => row.mint),
+    simulatedTokens(mint) {
+      const row = book.seller.snapshot().open.find((item) => item.mint === mint);
+      return row ? BigInt(row.paperTokens) : null;
+    },
+    snapshot: () => book.buyer.snapshot(),
+  };
+}
+
+function fanOut(sessions, event) {
+  if (event.type === "trade") return sessions.map((session) => session.trySignal(event, event.atMs));
+  if (event.type === "curve") return sessions.map((session) => session.observe(event.mint, event.state, event.atMs));
+  if (event.type === "pool") return sessions.map((session) => session.observePool(event.mint, event.view, event.atMs));
+  throw new Error(`unknown fixture event ${event.type}`);
+}
+
 async function main() {
   const decision = evaluateInvocation(process.argv, process.env);
   if (!decision.ok) {
@@ -162,16 +200,42 @@ async function main() {
   const comparison = decision.compare
     ? createComparison({ earlyExitFillPct: decision.earlyExitFillPct })
     : null;
-  const sessions = comparison
-    ? [comparison.pre, comparison.post]
-    : [createPaperSession(decision.strategy === "original" ? { strategy: "original" } : { strategy: "modified", earlyExitFillPct: decision.earlyExitFillPct })];
+  const relayBooks = [];
+  let sessions;
+  if (decision.relayCompare) {
+    const relayDir = path.resolve(decision.relayJsonl ? path.dirname(decision.relayJsonl) : path.join(here, "..", "..", "..", "paper-runs", "relay"));
+    fs.mkdirSync(relayDir, { recursive: true });
+    relayBooks.push(
+      createRelayBook({ policy: "immediate", poolFindTimeoutSec: decision.poolFindSec, jsonlPath: path.join(relayDir, "immediate.jsonl") }),
+      createRelayBook({ policy: "wait", waitSec: decision.waitSec, poolFindTimeoutSec: decision.poolFindSec, jsonlPath: path.join(relayDir, "wait.jsonl") }),
+    );
+    sessions = [
+      createPaperSession({ strategy: "exit-at-97", earlyExitFillPct: decision.earlyExitFillPct }),
+      relayAdapter(relayBooks[0], "relay-immediate"),
+      relayAdapter(relayBooks[1], "relay-wait"),
+    ];
+  } else {
+    sessions = comparison
+      ? [comparison.pre, comparison.post]
+      : [createPaperSession(decision.strategy === "original" ? { strategy: "original" } : { strategy: "modified", earlyExitFillPct: decision.earlyExitFillPct })];
+  }
   let data;
   let exitCode = 0;
 
   if (decision.mode === "fixture") {
     const fixturePath = path.resolve(decision.fixture);
     const fixture = JSON.parse(fs.readFileSync(fixturePath, "utf8"));
-    if (comparison) {
+    if (decision.relayCompare) {
+      let lastAt = 0;
+      for (const event of fixture.events) {
+        lastAt = event.atMs;
+        fanOut(sessions, event).forEach((result, index) => {
+          const row = decisionLine(`[PAPER ${sessions[index].config.strategy}]`, result);
+          if (row) log(row);
+        });
+      }
+      for (const book of relayBooks) book.settle(lastAt);
+    } else if (comparison) {
       for (const event of fixture.events) {
         if (event.type === "trade") {
           const both = comparison.trySignal(event, event.atMs);
@@ -220,14 +284,28 @@ async function main() {
     }
   }
 
+  if (decision.relayCompare && decision.mode !== "fixture") {
+    for (const book of relayBooks) book.settle(Date.now());
+  }
   const books = sessions.map((session) => session.snapshot());
+  const relayReports = decision.relayCompare
+    ? [null, relayBooks[0].report("B-relay-immediate"), relayBooks[1].report("C-relay-wait")]
+    : null;
   for (const snapshot of books) {
     for (const line of summaryLines(snapshot)) log(line);
     assertLedgerConserved(snapshot);
   }
   const graduatedOrClosed = books.some((snapshot) =>
     snapshot.stats.curveMarks > 0 || snapshot.stats.pendingPool > 0 || snapshot.stats.missedEarlyExits > 0 || snapshot.stats.missedExits > 0 || snapshot.stats.unpriceable > 0);
-  if (decision.compare) {
+  if (decision.relayCompare) {
+    for (const report of relayReports.slice(1)) {
+      log(`[PAPER] ${report.strategy} opens=${report.opens} curveCloses=${report.curveCloses} graduations=${report.graduationsCaptured} handoffs=${report.handoffs} pumpswapSells=${report.pumpswapSells} stuck=${report.stuck} feeAdjustedPnl=${report.feeAdjustedPnlSol} winRate=${report.winRate}`);
+    }
+    const graduations = relayReports.slice(1).reduce((sum, report) => sum + report.graduationsCaptured, 0);
+    log(graduations === 0
+      ? "[PAPER] INSUFFICIENT SAMPLE for the PumpSwap handoff: no graduation was captured. No winner."
+      : "[PAPER] Relay comparison is descriptive only. Mark-to-zero rows are write-offs, not fills. This is not proof of profitability.");
+  } else if (decision.compare) {
     log(graduatedOrClosed
       ? "[PAPER] Comparison is descriptive only. It does not name a winner and it is not proof of profitability."
       : "[PAPER] INSUFFICIENT SAMPLE: neither book recorded a graduation, a pool exit, or a missed exit. No winner.");
@@ -239,7 +317,10 @@ async function main() {
     snapshot: books[0],
     books,
     data,
-    comparisonVerdict: decision.compare ? (graduatedOrClosed ? "descriptive-only" : "insufficient-sample") : null,
+    comparisonVerdict: decision.relayCompare
+      ? (relayReports.slice(1).some((report) => report.graduationsCaptured > 0) ? "descriptive-only" : "insufficient-graduation-sample")
+      : decision.compare ? (graduatedOrClosed ? "descriptive-only" : "insufficient-sample") : null,
+    relayReports,
   });
   writeOutputs(decision, report, lines);
   process.exit(exitCode);

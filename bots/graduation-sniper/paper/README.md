@@ -57,7 +57,16 @@ Entry, size, and risk limits stay on the original `graduation.mjs` numbers. The 
 - **A `exit-at-97`.** Attempts a bonding-curve exit only when a curve read has `complete=false` and fill is at least 97% and still under 100% (configurable with `--early-exit-pct`, default 97). The mark uses that observed reserve state. It is not rewritten to a 97% price. A read at or above 100% fill, or a graduated, missing, or unreadable read, does not receive a backfilled 97% sale. Graduated, missing, and unreadable reads are missed exits: cash stays reserved and no profit is booked. A pre-graduation exit is not guaranteed.
 - **B `pumpswap-immediate`.** Holds through graduation. The labeled rule is the first validated PumpSwap quote after that observation. Migration does not imply liquidity. A missing, unverified, stale, zero-liquidity, or rate-limited pool stays pending or becomes a missed exit. No post-graduation price is taken from the `complete` flag.
 
-`--strategy modified` is the single book that also refuses new entries at or above 97%. `--strategy original` is the comparison baseline: entry under 100%, no 97% exit, and no PumpSwap quote. `--duration-sec` is an integer from 1 to 660.
+`--strategy modified` is the single book that also refuses new entries at or above 97%. `--strategy original` is the comparison baseline: entry under 100%, no 97% exit, and no PumpSwap quote. `--duration-sec` is an integer from 1 to 660, or up to 10800 with `--relay-compare`.
+
+`--relay-compare` adds the two-bot path. The curve buyer still uses stop-loss, take-profit, and timeout before graduation, and on graduation it writes a handoff instead of a curve sell. Book B sells on the first validated PumpSwap quote. Book C waits up to `--wait-sec` (default 120) for a 1.5x or 0.7x fee-adjusted PumpSwap result, then sells the last quote. If the pool never validates, the position is stuck and marked to zero proceeds. That write-off is not a fill.
+
+Separate processes use the same JSONL relay:
+
+```bash
+node bots/graduation-sniper/paper/buyer-bot.mjs --fixture events.json --relay-jsonl handoff.jsonl
+node bots/graduation-sniper/paper/seller-bot.mjs --relay-jsonl handoff.jsonl --pools pools.json --sell-policy immediate
+```
 
 A buy also needs both ledgers to still hold 0.1 SOL. The original dry-run does not check cash. When this runner refuses for cash, the decision is `insufficient_virtual_cash` and `originalWouldOpen` is true.
 

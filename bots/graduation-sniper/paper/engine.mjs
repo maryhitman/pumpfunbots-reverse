@@ -33,7 +33,7 @@ function requireConfig(options) {
     startingVirtualSol: PAPER_ASSUMPTIONS.startingVirtualSol,
     ...options,
   };
-  const known = new Set(["original", "modified", "exit-at-97", "pumpswap-immediate"]);
+  const known = new Set(["original", "modified", "exit-at-97", "pumpswap-immediate", "curve-handoff"]);
   if (!known.has(cfg.strategy)) throw new Error("unknown paper strategy");
   if (!Number.isFinite(cfg.buySol) || cfg.buySol <= 0) throw new Error("buySol must be positive");
   if (!Number.isFinite(cfg.startingVirtualSol) || cfg.startingVirtualSol < 0) {
@@ -57,8 +57,10 @@ function requireConfig(options) {
   cfg.exactOriginal = cfg.strategy === "original";
   cfg.blockEntryAtExit = cfg.strategy === "modified";
   cfg.preGraduationExit = cfg.strategy === "modified" || cfg.strategy === "exit-at-97";
-  cfg.postGraduation = cfg.strategy === "pumpswap-immediate" ? "pending-pool" : "unpriceable";
-  if (cfg.strategy === "original" || cfg.strategy === "pumpswap-immediate") {
+  cfg.postGraduation = cfg.strategy === "pumpswap-immediate"
+    ? "pending-pool"
+    : cfg.strategy === "curve-handoff" ? "handoff" : "unpriceable";
+  if (cfg.strategy === "original" || cfg.strategy === "pumpswap-immediate" || cfg.strategy === "curve-handoff") {
     if (Object.prototype.hasOwnProperty.call(options, "earlyExitFillPct")) {
       throw new Error(`${cfg.strategy} does not take an early-exit threshold`);
     }
@@ -82,6 +84,7 @@ export function createPaperSession(options = {}) {
   const startingLamports = solToLamports(cfg.startingVirtualSol);
   const active = new Map();
   const closed = [];
+  const handoffs = [];
   const watchlist = new Map();
   const decisions = [];
   const state = {
@@ -107,6 +110,7 @@ export function createPaperSession(options = {}) {
     poolBlocked: 0,
     pumpswapExits: 0,
     missedExits: 0,
+    handoffs: 0,
     decisions: 0,
   };
 
@@ -225,6 +229,40 @@ export function createPaperSession(options = {}) {
     } catch {
       return null;
     }
+  }
+
+  function emitHandoff(position, reason, curveState, nowMs) {
+    if (typeof cfg.onHandoff !== "function") throw new Error("curve-handoff requires onHandoff");
+    const signal = {
+      mint: position.mint,
+      paperTokens: position.improvedEntry.tokens.toString(),
+      spentLamports: position.spentLamports.toString(),
+      entryPrice: position.spotEntry,
+      entryFillPct: position.fillAtEntry,
+      entryAtMs: position.openedAtMs,
+      graduatedAtMs: nowMs,
+      graduationSlot: Number.isInteger(curveState?.slot) ? curveState.slot : null,
+      reason,
+    };
+    const published = cfg.onHandoff(signal) ?? {};
+    position.status = "handed_off";
+    position.slotLocked = false;
+    position.modelMark = null;
+    position.handoff = { ...signal, relayId: published.id ?? null };
+    active.delete(position.mint);
+    handoffs.push(position);
+    stats.handoffs += 1;
+    return {
+      observed: true,
+      mint: position.mint,
+      reason: "handoff",
+      handoff: position.handoff,
+      modelMark: null,
+      modelPnlBooked: false,
+      onChainSell: false,
+      successfulSell: false,
+      slotLocked: false,
+    };
   }
 
   function markPendingPool(position, reason, curveState) {
@@ -391,17 +429,19 @@ export function createPaperSession(options = {}) {
       return { observed: true, mint, reason: "already_pending", poolStatus: position.pendingReason, modelMark: null, modelPnlBooked: false, onChainSell: false, slotLocked: true };
     }
     if (curveState == null || curveState.missing === true) {
+      if (cfg.postGraduation === "handoff") return emitHandoff(position, "curve_missing", curveState, nowMs);
       return cfg.postGraduation === "pending-pool"
         ? markPendingPool(position, "curve_missing", curveState)
         : markUnpriceable(position, "curve_missing", curveState);
     }
     if (curveState.unreadable) {
-      if (cfg.postGraduation === "pending-pool") {
+      if (cfg.postGraduation === "pending-pool" || cfg.postGraduation === "handoff") {
         return { observed: true, mint, reason: "curve_unreadable_open", modelMark: null, modelPnlBooked: false, onChainSell: false, slotLocked: true };
       }
       return markUnpriceable(position, "curve_unreadable", curveState);
     }
     if (curveState.complete === true) {
+      if (cfg.postGraduation === "handoff") return emitHandoff(position, "graduated", curveState, nowMs);
       return cfg.postGraduation === "pending-pool"
         ? markPendingPool(position, "graduated", curveState)
         : markUnpriceable(position, "graduated", curveState);
@@ -582,7 +622,7 @@ export function createPaperSession(options = {}) {
       transactionsBroadcast: 0,
       successfulOnChainSells: 0,
       onChainRealizedSol: null,
-      performanceIncomplete: openUnpriceable > 0 || stillOpen > 0 || pending > 0,
+      performanceIncomplete: openUnpriceable > 0 || stillOpen > 0 || pending > 0 || handoffs.length > 0,
       doNotReadModelMarksAsRealizedProfit: true,
       ledgers: {
         faithful: {
@@ -605,6 +645,7 @@ export function createPaperSession(options = {}) {
       stats: { ...stats },
       active: [...active.values()].map(serializePosition),
       closed: closed.map(serializePosition),
+      handoffs: handoffs.map(serializePosition),
       recentDecisions: decisions,
       assumptions: ASSUMPTION_LINES,
       limitations: LIMITATION_LINES,
@@ -659,7 +700,8 @@ export function assertLedgerConserved(snapshot) {
   const start = BigInt(snapshot.startingBalance.lamports);
   for (const name of ["faithful", "improved"]) {
     const cash = BigInt(snapshot.ledgers[name].cash.lamports);
-    const reserved = [...snapshot.active].reduce((sum, p) => sum + BigInt(p.spent.lamports), 0n);
+    const reserved = [...snapshot.active].reduce((sum, p) => sum + BigInt(p.spent.lamports), 0n)
+      + [...(snapshot.handoffs ?? [])].reduce((sum, p) => sum + BigInt(p.spent.lamports), 0n);
     const paidOut = snapshot.closed.reduce((sum, p) => {
       const proceeds = name === "faithful" ? p.modelMark.faithful.lamports : p.modelMark.improved.lamports;
       return sum + BigInt(proceeds);

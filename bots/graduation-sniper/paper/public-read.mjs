@@ -218,7 +218,7 @@ async function pollSessions(http, sessions, pollErrors, log) {
       const now = Date.now();
       for (const session of sessions) {
         const outcome = session.observe(mint, state, now);
-        if (outcome.reason === "unpriceable" || outcome.reason === "pending_pool" || outcome.modelMark) {
+        if (outcome.reason === "handoff" || outcome.reason === "unpriceable" || outcome.reason === "pending_pool" || outcome.modelMark) {
           log(`[PAPER] ${session.config.strategy} curve mint=${mint} reason=${outcome.reason} missedEarlyExit=${outcome.missedEarlyExit === true} onChainSell=false`);
         }
       }

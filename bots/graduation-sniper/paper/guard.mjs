@@ -57,9 +57,14 @@ const FLAGS_WITH_VALUES = new Set([
   "--rpc-ws",
   "--strategy",
   "--early-exit-pct",
+  "--wait-sec",
+  "--pool-find-sec",
+  "--relay-jsonl",
+  "--sell-policy",
 ]);
 
 export const MAX_PUBLIC_DURATION_SEC = 660;
+export const MAX_RELAY_DURATION_SEC = 10_800;
 
 function refuse(message, ignoredEnv) {
   return { ok: false, exitCode: 2, message, ignoredEnv };
@@ -96,7 +101,12 @@ export function evaluateInvocation(argv, env = process.env) {
   let ws = null;
   let strategy = "modified";
   let compare = false;
+  let relayCompare = false;
   let earlyExitPassed = false;
+  let waitSec = 120;
+  let poolFindSec = 180;
+  let relayJsonl = null;
+  let sellPolicy = "immediate";
   let earlyExitFillPct = MODIFIED_EARLY_EXIT_FILL_PCT;
 
   for (let i = 0; i < args.length; i++) {
@@ -107,6 +117,10 @@ export function evaluateInvocation(argv, env = process.env) {
     }
     if (arg === "--compare") {
       compare = true;
+      continue;
+    }
+    if (arg === "--relay-compare") {
+      relayCompare = true;
       continue;
     }
     if (!FLAGS_WITH_VALUES.has(arg)) {
@@ -128,10 +142,24 @@ export function evaluateInvocation(argv, env = process.env) {
     else if (arg === "--early-exit-pct") {
       earlyExitPassed = true;
       earlyExitFillPct = Number(value);
-    }
+    } else if (arg === "--wait-sec") waitSec = Number(value);
+    else if (arg === "--pool-find-sec") poolFindSec = Number(value);
+    else if (arg === "--relay-jsonl") relayJsonl = value;
+    else if (arg === "--sell-policy") sellPolicy = value;
   }
 
-  if (compare && args.includes("--strategy")) {
+  if (compare && relayCompare) return refuse("Choose either --compare or --relay-compare.", ignoredEnv);
+  if (sellPolicy !== "immediate" && sellPolicy !== "wait") {
+    return refuse("--sell-policy must be immediate or wait.", ignoredEnv);
+  }
+  if (!Number.isFinite(waitSec) || waitSec < 0 || waitSec > 3600) {
+    return refuse("--wait-sec must be from 0 to 3600. Default is 120.", ignoredEnv);
+  }
+  if (!Number.isFinite(poolFindSec) || poolFindSec < 1 || poolFindSec > 3600) {
+    return refuse("--pool-find-sec must be from 1 to 3600. Default is 180.", ignoredEnv);
+  }
+
+  if ((compare || relayCompare) && args.includes("--strategy")) {
     return refuse("--compare runs exit-at-97 and pumpswap-immediate together. Do not also pass --strategy.", ignoredEnv);
   }
   if (!compare && strategy !== "modified" && strategy !== "original") {
@@ -151,9 +179,10 @@ export function evaluateInvocation(argv, env = process.env) {
     earlyExitFillPct = null;
   }
 
-  if ((publicRead || durationPassed) && (!Number.isInteger(durationSec) || durationSec < 1 || durationSec > MAX_PUBLIC_DURATION_SEC)) {
+  const durationCap = relayCompare ? MAX_RELAY_DURATION_SEC : MAX_PUBLIC_DURATION_SEC;
+  if ((publicRead || durationPassed) && (!Number.isInteger(durationSec) || durationSec < 1 || durationSec > durationCap)) {
     return refuse(
-      `--duration-sec must be an integer from 1 to ${MAX_PUBLIC_DURATION_SEC}. This entrypoint will not run as a daemon.`,
+      `--duration-sec must be an integer from 1 to ${durationCap}. This entrypoint will not run as a daemon.`,
       ignoredEnv,
     );
   }
@@ -186,6 +215,11 @@ export function evaluateInvocation(argv, env = process.env) {
     endpoints,
     strategy: compare ? "compare" : strategy,
     compare,
+    relayCompare,
+    waitSec,
+    poolFindSec,
+    relayJsonl,
+    sellPolicy,
     earlyExitFillPct,
   };
 }

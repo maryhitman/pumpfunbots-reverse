@@ -9,6 +9,8 @@ import { BUY_INSTRUCTIONS, PUMP_PROGRAM, TRADE_EVENT_PREFIX } from "../../../lib
 import { quoteBuy, quoteSell, spotRatioProceedsLamports } from "./curve.mjs";
 import { PAPER_ASSUMPTIONS, PUMP_PROGRAM_ID, STRATEGY_DEFAULTS, solToLamports } from "./defaults.mjs";
 import { assertLedgerConserved, createComparison, createPaperSession, virtualSolFillPct } from "./engine.mjs";
+import { createRelayBook } from "./relay-book.mjs";
+import { readRelay } from "./relay.mjs";
 import {
   FEE_CONFIG_DISC,
   GLOBAL_CONFIG_DISC,
@@ -335,6 +337,8 @@ test("the entrypoint refuses live flags, key material, and non-public RPCs", () 
   );
   assert.equal(evaluateInvocation(["node", "run.mjs", "--public-readonly", "--duration-sec", "661"], {}).ok, false);
   assert.equal(evaluateInvocation(["node", "run.mjs", "--public-readonly", "--duration-sec", "600"], {}).ok, true);
+  assert.equal(evaluateInvocation(["node", "run.mjs", "--relay-compare", "--public-readonly", "--duration-sec", "7200"], {}).ok, true);
+  assert.equal(evaluateInvocation(["node", "run.mjs", "--relay-compare", "--public-readonly", "--duration-sec", "10801"], {}).ok, false);
   assert.equal(evaluateInvocation(["node", "run.mjs", "--compare", "--strategy", "original", "--fixture", "x"], {}).ok, false);
   assert.equal(evaluateInvocation(["node", "run.mjs"], {}).ok, false);
   const ok = evaluateInvocation(["node", "run.mjs", "--public-readonly"], { HELIUS_API_KEY: "ignored", GRAD_BUY_SOL: "5" });
@@ -571,3 +575,83 @@ test("97% and PumpSwap books share entries and do not invent a missed fill", () 
   assertLedgerConserved(full.pre.snapshot());
   assertLedgerConserved(full.post.snapshot());
 });
+
+test("relay handoff, missing pool, and delayed pool stay paper-only", () => {
+  const dir = fs.mkdtempSync(path.join("/tmp", "grad-relay-"));
+  const jsonl = path.join(dir, "handoff.jsonl");
+  const book = createRelayBook({ policy: "immediate", poolFindTimeoutSec: 180, jsonlPath: jsonl });
+  assert.equal(book.trySignal({ mint: "grad", ...reserves() }, 1_000).accepted, true);
+  const sl = book.observe("grad", { complete: false, ...reserves(50_000_000_000n) }, 2_000);
+  assert.equal(sl.reason, "stop_loss");
+  assert.equal(sl.modelMark.onChainSell, false);
+  assert.equal(book.buyer.snapshot().stats.handoffs, 0);
+
+  book.trySignal({ mint: "late", ...reserves() }, 40_000);
+  const hand = book.observe("late", { complete: true, ...reserves(90_000_000_000n), slot: 50 }, 41_000);
+  assert.equal(hand.reason, "handoff");
+  assert.equal(hand.modelPnlBooked, false);
+  assert.equal(hand.handoff.mint, "late");
+  assert.equal(hand.handoff.graduationSlot, 50);
+  assert.equal(book.buyer.snapshot().stats.handoffs, 1);
+  const lines = readRelay(jsonl);
+  assert.equal(lines.some((line) => line.type === "handoff" && line.mint === "late"), true);
+  assert.equal(lines.some((line) => line.type === "ack" && line.status === "accepted"), true);
+
+  const missing = book.observePool("late", { status: "missing_pool", validated: false, slot: 51 }, 50_000);
+  assert.equal(missing.reason, "seeking_pool");
+  assert.equal(missing.modelPnlBooked, false);
+  const stuck = book.observePool("late", { status: "missing_pool", validated: false, slot: 80 }, 41_000 + 180_000);
+  assert.equal(stuck.reason, "mark_to_zero");
+  assert.equal(stuck.modelMark.markToZero, true);
+  assert.equal(stuck.modelMark.pnlSol, "-0.100000000");
+  assert.equal(stuck.onChainSell, false);
+  assert.equal(book.report("B").stuck, 1);
+  assert.equal(book.report("B").pumpswapSells, 0);
+
+  const delayed = createRelayBook({ policy: "immediate", poolFindTimeoutSec: 180 });
+  delayed.trySignal({ mint: "soon", ...reserves() }, 0);
+  delayed.observe("soon", { complete: true, slot: 10, ...reserves() }, 5_000);
+  assert.equal(delayed.observePool("soon", { status: "missing_pool", validated: false, slot: 11 }, 6_000).reason, "seeking_pool");
+  const stale = delayed.observePool("soon", quoteView(1_000_000_000n, 9), 7_000);
+  assert.equal(stale.reason, "seeking_pool");
+  assert.equal(stale.poolStatus, "stale_or_lookahead");
+  const sold = delayed.observePool("soon", {
+    status: "executable",
+    validated: true,
+    slot: 12,
+    userQuoteLamports: 130_000_000n,
+    lpFeeLamports: 100n,
+    protocolFeeLamports: 50n,
+    creatorFeeLamports: 50n,
+    formula: "pump-swap-sdk-2.2.0 sellBaseInput",
+  }, 9_000);
+  assert.equal(sold.reason, "pumpswap_immediate_exit");
+  assert.equal(sold.modelMark.poolFoundLatencyMs, 4_000);
+  assert.equal(sold.modelMark.pnlSol, "0.030000000");
+  assert.equal(delayed.report("B").winRate, 1);
+  assert.equal(delayed.observePool("soon", quoteView(1n, 13), 10_000).reason, "no_position");
+
+  const wait = createRelayBook({ policy: "wait", waitSec: 120, poolFindTimeoutSec: 180 });
+  wait.trySignal({ mint: "w", ...reserves() }, 0);
+  wait.observe("w", { complete: true, slot: 3, ...reserves() }, 1_000);
+  const held = wait.observePool("w", quoteView(110_000_000n, 4), 2_000);
+  assert.equal(held.reason, "waiting_tp_sl");
+  const tp = wait.observePool("w", quoteView(160_000_000n, 5), 30_000);
+  assert.equal(tp.reason, "pumpswap_take_profit");
+  assert.equal(tp.onChainSell, false);
+  assertLedgerConserved(book.buyer.snapshot());
+  assertLedgerConserved(delayed.buyer.snapshot());
+});
+
+function quoteView(userQuoteLamports, slot) {
+  return {
+    status: "executable",
+    validated: true,
+    slot,
+    userQuoteLamports,
+    lpFeeLamports: 1n,
+    protocolFeeLamports: 1n,
+    creatorFeeLamports: 1n,
+    formula: "pump-swap-sdk-2.2.0 sellBaseInput",
+  };
+}
