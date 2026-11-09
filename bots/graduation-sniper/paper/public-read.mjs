@@ -460,31 +460,62 @@ function publicAttempt(attempt) {
 }
 
 export async function runReadOnlySession({ endpoints, durationSec, session, sessions, log, pollMs }) {
+  const deadline = Date.now() + durationSec * 1000;
   const attempts = [];
-  for (const endpoint of endpoints) {
-    log(`[PAPER] probing ${endpoint.name} http=${endpoint.http} ws=${endpoint.ws}`);
-    try {
-      const used = await streamEndpoint({
-        endpoint,
-        sessions: sessions ?? [session],
-        log,
-        durationSec,
-        pollMs,
-      });
-      const attempt = publicAttempt({ ...used, ok: true, error: null });
-      attempts.push(attempt);
-      return { ok: true, attempts, used: attempt };
-    } catch (err) {
-      const message = err?.message || String(err);
-      log(`[PAPER] DATA ACCESS FAILED ${endpoint.name}: ${message}`);
-      attempts.push({
-        name: endpoint.name,
-        http: endpoint.http,
-        ws: endpoint.ws,
-        ok: false,
-        error: message,
-      });
+  const totals = { notifications: 0, tradeEvents: 0, parseErrors: 0, pollErrors: [] };
+  let used = null;
+  let reconnects = 0;
+  while (Date.now() + 1000 < deadline && reconnects < 40) {
+    const remainSec = Math.max(1, Math.ceil((deadline - Date.now()) / 1000));
+    let connected = false;
+    for (const endpoint of endpoints) {
+      if (Date.now() + 1000 >= deadline) break;
+      log(`[PAPER] probing ${endpoint.name} http=${endpoint.http} ws=${endpoint.ws} remainSec=${remainSec}`);
+      try {
+        const part = await streamEndpoint({
+          endpoint,
+          sessions: sessions ?? [session],
+          log,
+          durationSec: remainSec,
+          pollMs,
+        });
+        totals.notifications += part.counters?.notifications ?? 0;
+        totals.tradeEvents += part.counters?.tradeEvents ?? 0;
+        totals.parseErrors += part.counters?.parseErrors ?? 0;
+        totals.pollErrors.push(...(part.counters?.pollErrors ?? []));
+        const elapsedMs = durationSec * 1000 - Math.max(0, deadline - Date.now());
+        used = {
+          ...part,
+          ok: true,
+          error: null,
+          counters: { ...totals, pollErrors: totals.pollErrors.slice(-20) },
+          elapsedMs,
+          completed: part.completed || Date.now() + 1000 >= deadline,
+          disconnect: part.completed ? null : part.disconnect,
+        };
+        attempts.push(publicAttempt(used));
+        connected = true;
+        if (part.completed || Date.now() + 1000 >= deadline) {
+          return { ok: true, attempts, used: publicAttempt(used) };
+        }
+        log(`[PAPER] read socket closed early (${part.disconnect ?? "unknown"}). Reconnecting within the bounded window.`);
+        reconnects += 1;
+        break;
+      } catch (err) {
+        const message = err?.message || String(err);
+        log(`[PAPER] DATA ACCESS FAILED ${endpoint.name}: ${message}`);
+        attempts.push({
+          name: endpoint.name,
+          http: endpoint.http,
+          ws: endpoint.ws,
+          ok: false,
+          error: message,
+        });
+      }
     }
+    if (!connected) break;
+    await new Promise((resolve) => setTimeout(resolve, 2000));
   }
+  if (used) return { ok: true, attempts, used: publicAttempt(used) };
   return { ok: false, attempts, used: null };
 }
