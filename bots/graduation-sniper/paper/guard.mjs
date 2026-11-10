@@ -103,6 +103,7 @@ export function evaluateInvocation(argv, env = process.env) {
   let compare = false;
   let relayCompare = false;
   let directCompare = false;
+  let midCompare = false;
   let earlyExitPassed = false;
   let waitSec = 120;
   let poolFindSec = 180;
@@ -127,6 +128,10 @@ export function evaluateInvocation(argv, env = process.env) {
     if (arg === "--direct-compare") {
       relayCompare = true;
       directCompare = true;
+      continue;
+    }
+    if (arg === "--mid-compare") {
+      midCompare = true;
       continue;
     }
     if (!FLAGS_WITH_VALUES.has(arg)) {
@@ -155,6 +160,7 @@ export function evaluateInvocation(argv, env = process.env) {
   }
 
   if (compare && relayCompare) return refuse("Choose either --compare or --relay-compare.", ignoredEnv);
+  if (midCompare && (compare || relayCompare)) return refuse("Choose one comparison mode.", ignoredEnv);
   if (sellPolicy !== "immediate" && sellPolicy !== "wait") {
     return refuse("--sell-policy must be immediate or wait.", ignoredEnv);
   }
@@ -165,7 +171,7 @@ export function evaluateInvocation(argv, env = process.env) {
     return refuse("--pool-find-sec must be from 1 to 3600. Default is 180.", ignoredEnv);
   }
 
-  if ((compare || relayCompare) && args.includes("--strategy")) {
+  if ((compare || relayCompare || midCompare) && args.includes("--strategy")) {
     return refuse("--compare runs exit-at-97 and pumpswap-immediate together. Do not also pass --strategy.", ignoredEnv);
   }
   if (!compare && strategy !== "modified" && strategy !== "original") {
@@ -185,7 +191,7 @@ export function evaluateInvocation(argv, env = process.env) {
     earlyExitFillPct = null;
   }
 
-  const durationCap = relayCompare ? MAX_RELAY_DURATION_SEC : MAX_PUBLIC_DURATION_SEC;
+  const durationCap = relayCompare || midCompare ? MAX_RELAY_DURATION_SEC : MAX_PUBLIC_DURATION_SEC;
   if ((publicRead || durationPassed) && (!Number.isInteger(durationSec) || durationSec < 1 || durationSec > durationCap)) {
     return refuse(
       `--duration-sec must be an integer from 1 to ${durationCap}. This entrypoint will not run as a daemon.`,
@@ -223,6 +229,7 @@ export function evaluateInvocation(argv, env = process.env) {
     compare,
     relayCompare,
     directCompare,
+    midCompare,
     waitSec,
     poolFindSec,
     relayJsonl,

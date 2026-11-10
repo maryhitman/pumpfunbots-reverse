@@ -12,12 +12,16 @@ export function createRelayBook({
   poolFindTimeoutSec = 180,
   jsonlPath,
   startingVirtualSol = PAPER_ASSUMPTIONS.startingVirtualSol,
+  buySol,
+  maxPositions,
 } = {}) {
   const relay = createRelay({ jsonlPath });
   const seller = createSeller({ policy, waitSec, poolFindTimeoutSec, relay });
   const buyer = createPaperSession({
     strategy: "curve-handoff",
     startingVirtualSol,
+    ...(buySol == null ? {} : { buySol }),
+    ...(maxPositions == null ? {} : { maxPositions }),
     onHandoff(signal) {
       const record = relay.publish(signal);
       seller.accept(record, signal.graduatedAtMs);

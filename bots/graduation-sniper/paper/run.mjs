@@ -4,7 +4,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { ASSUMPTION_LINES, LIMITATION_LINES, PAPER_ASSUMPTIONS } from "./defaults.mjs";
+import { ASSUMPTION_LINES, LIMITATION_LINES, PAPER_ASSUMPTIONS, lamportsToSolString } from "./defaults.mjs";
 import { assertLedgerConserved, createComparison, createPaperSession } from "./engine.mjs";
 import { createRelayBook } from "./relay-book.mjs";
 import { evaluateInvocation } from "./guard.mjs";
@@ -25,14 +25,19 @@ function readReview() {
 function bannerLines(review, decision) {
   const lines = [
     "=== GRADUATION SNIPER — PAPER ONLY ===",
-    "VIRTUAL STARTING BALANCE: 10 SOL each book. Simulated cash. Not a wallet, not withdrawable.",
+    `VIRTUAL STARTING BALANCE: ${decision.midCompare ? "3" : "10"} SOL each book. Simulated cash. Not a wallet, not withdrawable.`,
     "No key file is read. No transaction is signed or broadcast.",
     "Shared safeguards from graduation.mjs: entry fill>=92% of 85 virtual SOL, buy 0.1 SOL, TP 1.5x, SL 0.7x, timeout 300s, max 3 positions, cooldown 30s.",
     "Faithful curve ledger: original dry-run spot ratio, no fee, no impact.",
     "Improved curve ledger: repo calcBuyTokens/calcSellSol with truncating 1% fee.",
     "A PumpSwap mark uses the documented sellBaseInput quote only after the pool, vaults, mint, and fee schedule validate. It is not a spot fill.",
   ];
-  if (decision.directCompare) {
+  if (decision.midCompare) {
+    lines.push("MID COMPARE: E mid-curve 50->90, A exit-at-97, B relay PumpSwap immediate with a Jupiter quote fallback. Each book starts at 3 virtual SOL and bets 0.2 SOL.");
+    lines.push("E buys the first time fill is inside 50-55% and does not chase a coin first seen above 55%. It sells on the curve at the first complete=false read at or above 90%, at a 0.7x fee-adjusted stop, or at the 30 minute mark using the current curve quote.");
+    lines.push("E allows 10 positions, which is 2 SOL of open cost. A and B keep 3 positions. A new 0.2 SOL entry is skipped, and counted, when the book has less than 0.2 SOL free.");
+    lines.push("No key is loaded. Jupiter, if B needs a quote, is GET /swap/v1/quote only.");
+  } else if (decision.directCompare) {
     lines.push("DIRECT COMPARE: A exit-at-97, B PumpSwap-direct immediate, D Jupiter-direct immediate. Each starts at 10 virtual SOL.");
     lines.push("D quotes Jupiter as soon as the graduation handoff arrives, retries about every 0.5-1s with two keep-alive requests, and books the first route. No route within 60s is stuck and marked to zero.");
     lines.push("Paper quotes ignore landing delay and execution slippage. The swap endpoint is not called.");
@@ -88,7 +93,7 @@ function decisionLine(prefix, result) {
     ].join("\n");
   }
   if (result.accepted === true) {
-    return `${prefix} OPEN counterfactual mint=${result.mint} fill=${Number(result.fillPct).toFixed(2)}% virtual debit=0.1 SOL onChainFill=false`;
+    return `${prefix} OPEN counterfactual mint=${result.mint} fill=${Number(result.fillPct).toFixed(2)}% onChainFill=false`;
   }
   if (result.accepted === false && result.reason !== "below_fill" && result.reason !== "fill_at_or_above_100") {
     return `${prefix} REJECT mint=${result.mint} reason=${result.reason} originalWouldOpen=${result.originalWouldOpen}`;
@@ -96,12 +101,81 @@ function decisionLine(prefix, result) {
   return null;
 }
 
+function percentOnStart(pnlLamports, startLamports) {
+  if (startLamports === 0n) return "0.00%";
+  const scaled = (pnlLamports * 10000n) / startLamports;
+  const neg = scaled < 0n;
+  const abs = neg ? -scaled : scaled;
+  return `${neg ? "-" : ""}${abs / 100n}.${(abs % 100n).toString().padStart(2, "0")}%`;
+}
+
+function bookOutcome(snapshot, extraCloses = []) {
+  const start = BigInt(snapshot.startingBalance.lamports);
+  const cash = BigInt(snapshot.ledgers.improved.cash.lamports);
+  const reserved = BigInt(snapshot.ledgers.improved.reservedOpen.lamports);
+  const rows = [];
+  const reasons = { target: 0, stop_loss: 0, timeout: 0, take_profit: 0, graduation: 0, other: 0 };
+  let holdMs = 0;
+  let holdN = 0;
+  let wins = 0;
+  for (const position of snapshot.closed) {
+    const trigger = position.modelMark?.trigger;
+    const pnl = BigInt(position.modelMark?.improved?.pnl?.lamports ?? position.modelMark?.pnlLamports ?? 0);
+    if (trigger === "target" || trigger === "early_exit") reasons.target += 1;
+    else if (trigger === "stop_loss") reasons.stop_loss += 1;
+    else if (trigger === "timeout") reasons.timeout += 1;
+    else if (trigger === "take_profit") reasons.take_profit += 1;
+    else reasons.other += 1;
+    rows.push(pnl);
+    if (pnl > 0n) wins += 1;
+    if (position.closedAtMs != null) {
+      holdMs += position.closedAtMs - position.openedAtMs;
+      holdN += 1;
+    }
+  }
+  for (const close of extraCloses) {
+    const pnl = BigInt(close.pnlLamports);
+    reasons.graduation += 1;
+    rows.push(pnl);
+    if (pnl > 0n) wins += 1;
+    if (close.holdMs != null) {
+      holdMs += close.holdMs;
+      holdN += 1;
+    }
+  }
+  const pnl = rows.reduce((sum, value) => sum + value, 0n);
+  const biggest = rows.length === 0 ? 0n : rows.reduce((best, value) => (value > best ? value : best));
+  const open = snapshot.active.filter((position) => position.status === "open").length;
+  const died = snapshot.stats.died ?? snapshot.active.filter((position) => position.status === "unpriceable").length;
+  return {
+    name: snapshot.strategy.name,
+    startSol: snapshot.startingBalance.sol,
+    cashSol: snapshot.ledgers.improved.cash.sol,
+    reservedSol: snapshot.ledgers.improved.reservedOpen.sol,
+    equityLamports: (cash + reserved + extraCloses.reduce((sum, close) => sum + BigInt(close.proceedsLamports ?? 0), 0n)).toString(),
+    equitySol: lamportsToSolString(cash + reserved + extraCloses.reduce((sum, close) => sum + BigInt(close.proceedsLamports ?? 0), 0n)),
+    opens: snapshot.stats.opened,
+    reasons,
+    stillOpen: open,
+    died,
+    skippedInsufficientCash: snapshot.stats.skippedInsufficientCash ?? 0,
+    skippedAboveBand: snapshot.stats.skippedAboveBand ?? 0,
+    pnlSol: lamportsToSolString(pnl),
+    pnlExcludingBiggestSol: lamportsToSolString(pnl - biggest),
+    returnPct: percentOnStart(pnl, start),
+    wins,
+    closed: rows.length,
+    winRate: rows.length === 0 ? null : wins / rows.length,
+    avgHoldSec: holdN === 0 ? null : holdMs / holdN / 1000,
+  };
+}
+
 function summaryLines(snapshot) {
   const open = snapshot.active.filter((position) => position.status === "open").length;
   const pending = snapshot.active.filter((position) => position.status === "pending_pool").length;
   const lines = [
     `=== ${snapshot.strategy.name} ===`,
-    `Virtual cash faithful: ${snapshot.ledgers.faithful.cash.sol} SOL. Improved/quote cash: ${snapshot.ledgers.improved.cash.sol} SOL. Start ${snapshot.startingBalance.sol}.`,
+    `Virtual cash faithful: ${snapshot.ledgers.faithful.cash.sol} SOL. Improved/quote cash: ${snapshot.ledgers.improved.cash.sol} SOL. Start ${snapshot.startingBalance.sol}. Reserved open ${snapshot.ledgers.improved.reservedOpen.sol}.`,
     `Modeled mark PnL faithful: ${snapshot.ledgers.faithful.modelMarkPnl.sol} SOL. Fee-adjusted or curve-improved: ${snapshot.ledgers.improved.modelMarkPnl.sol} SOL.`,
     `Closed marks: ${snapshot.stats.curveMarks}. Early exits: ${snapshot.stats.earlyExits}. PumpSwap exits: ${snapshot.stats.pumpswapExits}. Open: ${open}. Pending pool: ${pending}. Unpriceable: ${snapshot.stats.unpriceable}. Missed early exits: ${snapshot.stats.missedEarlyExits}. Other missed exits: ${snapshot.stats.missedExits}.`,
     "These figures are counterfactual model marks, not realized profits and not proof of profitability.",
@@ -208,7 +282,23 @@ async function main() {
     : null;
   const relayBooks = [];
   let sessions;
-  if (decision.relayCompare) {
+  const compareSize = { buySol: 0.2, startingVirtualSol: 3 };
+  if (decision.midCompare) {
+    const relayDir = path.resolve(decision.relayJsonl ? path.dirname(decision.relayJsonl) : path.join(here, "..", "..", "..", "paper-runs", "mid"));
+    fs.mkdirSync(relayDir, { recursive: true });
+    relayBooks.push(createRelayBook({
+      policy: "immediate",
+      poolFindTimeoutSec: decision.poolFindSec,
+      jsonlPath: path.join(relayDir, "immediate.jsonl"),
+      ...compareSize,
+      maxPositions: 3,
+    }));
+    sessions = [
+      createPaperSession({ strategy: "mid-curve-50-90", ...compareSize, maxPositions: 10 }),
+      createPaperSession({ strategy: "exit-at-97", earlyExitFillPct: decision.earlyExitFillPct, ...compareSize, maxPositions: 3 }),
+      relayAdapter(relayBooks[0], "relay-immediate"),
+    ];
+  } else if (decision.relayCompare) {
     const relayDir = path.resolve(decision.relayJsonl ? path.dirname(decision.relayJsonl) : path.join(here, "..", "..", "..", "paper-runs", "relay"));
     fs.mkdirSync(relayDir, { recursive: true });
     if (decision.directCompare) {
@@ -302,7 +392,7 @@ async function main() {
     }
   }
 
-  if (decision.relayCompare && decision.mode !== "fixture") {
+  if ((decision.relayCompare || decision.midCompare) && decision.mode !== "fixture") {
     const { fetchJupiterQuote } = await import("./jupiter-quote.mjs");
     for (const book of relayBooks) {
       for (const row of book.seller.snapshot().open) {
@@ -315,7 +405,9 @@ async function main() {
     }
   }
   const books = sessions.map((session) => session.snapshot());
-    const relayReports = decision.relayCompare
+    const relayReports = decision.midCompare
+    ? [null, null, relayBooks[0].report("B-relay-immediate")]
+    : decision.relayCompare
     ? [
       null,
       relayBooks[0].report(decision.directCompare ? "B-pumpswap-direct" : "B-relay-immediate"),
@@ -328,7 +420,21 @@ async function main() {
   }
   const graduatedOrClosed = books.some((snapshot) =>
     snapshot.stats.curveMarks > 0 || snapshot.stats.pendingPool > 0 || snapshot.stats.missedEarlyExits > 0 || snapshot.stats.missedExits > 0 || snapshot.stats.unpriceable > 0);
-  if (decision.relayCompare) {
+  let midOutcomes = null;
+  if (decision.midCompare) {
+    const openedAt = new Map((books[2].handoffs ?? []).map((row) => [row.mint, row.openedAtMs]));
+    const sellerCloses = relayBooks[0].seller.snapshot().closed.map((row) => ({
+      pnlLamports: row.modelMark.pnlLamports,
+      proceedsLamports: row.modelMark.proceedsLamports,
+      holdMs: row.modelMark.atMs != null && openedAt.has(row.mint) ? row.modelMark.atMs - openedAt.get(row.mint) : null,
+    }));
+    midOutcomes = books.map((snapshot, index) => bookOutcome(snapshot, index === 2 ? sellerCloses : []));
+    const labels = ["E", "A", "B"];
+    midOutcomes.forEach((outcome, index) => {
+      log(`[PAPER] ${labels[index]} ${outcome.name} opens=${outcome.opens} target=${outcome.reasons.target} sl=${outcome.reasons.stop_loss} timeout=${outcome.reasons.timeout} tp=${outcome.reasons.take_profit} graduationSells=${outcome.reasons.graduation} died=${outcome.died} open=${outcome.stillOpen} skipped: insufficient paper cash=${outcome.skippedInsufficientCash} skippedAbove55=${outcome.skippedAboveBand} pnl=${outcome.pnlSol} pnlExBiggest=${outcome.pnlExcludingBiggestSol} returnOn3Sol=${outcome.returnPct} winRate=${outcome.winRate} avgHoldSec=${outcome.avgHoldSec} endCash=${outcome.cashSol} reserved=${outcome.reservedSol} endingBalance=${outcome.equitySol}`);
+    });
+    log("[PAPER] Mid-curve comparison is descriptive only. Marks are not landed trades. On-chain sells: 0.");
+  } else if (decision.relayCompare) {
     for (const report of relayReports.slice(1)) {
       log(`[PAPER] ${report.strategy} opens=${report.opens} curveCloses=${report.curveCloses} graduations=${report.graduationsCaptured} handoffs=${report.handoffs} pumpswapSells=${report.pumpswapSells} stuck=${report.stuck} feeAdjustedPnl=${report.feeAdjustedPnlSol} winRate=${report.winRate}`);
     }
@@ -353,6 +459,7 @@ async function main() {
       : decision.compare ? (graduatedOrClosed ? "descriptive-only" : "insufficient-sample") : null,
     relayReports,
   });
+  if (midOutcomes) report.midOutcomes = midOutcomes;
   writeOutputs(decision, report, lines);
   process.exit(exitCode);
 }

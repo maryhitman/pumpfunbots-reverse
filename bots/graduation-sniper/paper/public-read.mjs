@@ -368,7 +368,12 @@ function runStream({ ws, parser, subId, http, sessions, log, durationSec, pollMs
           },
           Date.now(),
         );
-        if (decision.reason !== "below_fill" && decision.reason !== "fill_at_or_above_100") {
+        const quiet = decision.reason === "below_fill"
+          || decision.reason === "fill_at_or_above_100"
+          || decision.reason === "above_entry_band"
+          || decision.reason === "already_skipped"
+          || decision.reason === "already_traded";
+        if (!quiet) {
           log(
             `[PAPER] ${session.config.strategy} signal mint=${event.mint} fill=${Number(decision.fillPct).toFixed(2)} accepted=${decision.accepted} reason=${decision.reason}`,
           );

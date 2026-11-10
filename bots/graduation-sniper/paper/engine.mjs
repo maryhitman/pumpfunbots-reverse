@@ -33,8 +33,17 @@ function requireConfig(options) {
     startingVirtualSol: PAPER_ASSUMPTIONS.startingVirtualSol,
     ...options,
   };
-  const known = new Set(["original", "modified", "exit-at-97", "pumpswap-immediate", "curve-handoff"]);
+  const known = new Set(["original", "modified", "exit-at-97", "pumpswap-immediate", "curve-handoff", "mid-curve-50-90"]);
   if (!known.has(cfg.strategy)) throw new Error("unknown paper strategy");
+  if (cfg.strategy === "mid-curve-50-90") {
+    if (!Object.prototype.hasOwnProperty.call(options, "minFillPct")) cfg.minFillPct = 50;
+    if (!Object.prototype.hasOwnProperty.call(options, "entryBandMaxPct")) cfg.entryBandMaxPct = 55;
+    if (!Object.prototype.hasOwnProperty.call(options, "earlyExitFillPct")) cfg.earlyExitFillPct = 90;
+    if (!Object.prototype.hasOwnProperty.call(options, "maxPositions")) cfg.maxPositions = 10;
+    if (!Object.prototype.hasOwnProperty.call(options, "timeoutSec")) cfg.timeoutSec = 1800;
+    cfg.feeAdjustedStop = true;
+    cfg.useTakeProfit = false;
+  }
   if (!Number.isFinite(cfg.buySol) || cfg.buySol <= 0) throw new Error("buySol must be positive");
   if (!Number.isFinite(cfg.startingVirtualSol) || cfg.startingVirtualSol < 0) {
     throw new Error("startingVirtualSol must be non-negative");
@@ -56,10 +65,17 @@ function requireConfig(options) {
   }
   cfg.exactOriginal = cfg.strategy === "original";
   cfg.blockEntryAtExit = cfg.strategy === "modified";
-  cfg.preGraduationExit = cfg.strategy === "modified" || cfg.strategy === "exit-at-97";
+  cfg.preGraduationExit = cfg.strategy === "modified" || cfg.strategy === "exit-at-97" || cfg.strategy === "mid-curve-50-90";
   cfg.postGraduation = cfg.strategy === "pumpswap-immediate"
     ? "pending-pool"
     : cfg.strategy === "curve-handoff" ? "handoff" : "unpriceable";
+  cfg.feeAdjustedStop = cfg.feeAdjustedStop === true;
+  cfg.useTakeProfit = cfg.useTakeProfit !== false;
+  if (cfg.strategy === "mid-curve-50-90") {
+    if (!Number.isFinite(cfg.entryBandMaxPct) || cfg.entryBandMaxPct <= cfg.minFillPct || cfg.entryBandMaxPct >= cfg.earlyExitFillPct) {
+      throw new Error("entryBandMaxPct must sit between the entry fill and the 90% exit");
+    }
+  }
   if (cfg.strategy === "original" || cfg.strategy === "pumpswap-immediate" || cfg.strategy === "curve-handoff") {
     if (Object.prototype.hasOwnProperty.call(options, "earlyExitFillPct")) {
       throw new Error(`${cfg.strategy} does not take an early-exit threshold`);
@@ -112,7 +128,14 @@ export function createPaperSession(options = {}) {
     missedExits: 0,
     handoffs: 0,
     decisions: 0,
+    targetExits: 0,
+    stopLosses: 0,
+    timeouts: 0,
+    died: 0,
+    skippedInsufficientCash: 0,
+    skippedAboveBand: 0,
   };
+  const seenBand = new Map();
 
   function remember(entry) {
     stats.decisions += 1;
@@ -156,7 +179,29 @@ export function createPaperSession(options = {}) {
     stats.inBand += 1;
     const prev = watchlist.get(signal.mint);
     if (!prev || fill > prev.fillPct) watchlist.set(signal.mint, { fillPct: fill, atMs: nowMs });
+    if (cfg.strategy === "mid-curve-50-90") return considerMidEntry({ mint: signal.mint, vSol, vTok, fill, nowMs });
     return openPosition({ mint: signal.mint, vSol, vTok, fill, nowMs });
+  }
+
+  function considerMidEntry({ mint, vSol, vTok, fill, nowMs }) {
+    const phase = seenBand.get(mint) ?? "new";
+    if (fill > cfg.entryBandMaxPct) {
+      if (phase === "traded") return reject("already_traded", { mint, fillPct: fill, originalWouldOpen: false });
+      if (phase === "skip") return reject("already_skipped", { mint, fillPct: fill, originalWouldOpen: false });
+      seenBand.set(mint, "skip");
+      stats.skippedAboveBand += 1;
+      return reject("above_entry_band", {
+        mint,
+        fillPct: fill,
+        originalWouldOpen: false,
+        note: "First observation above 55% is not chased.",
+      });
+    }
+    if (phase === "skip") return reject("already_skipped", { mint, fillPct: fill, originalWouldOpen: false });
+    if (phase === "traded") return reject("already_traded", { mint, fillPct: fill, originalWouldOpen: false });
+    const opened = openPosition({ mint, vSol, vTok, fill, nowMs });
+    if (opened.accepted) seenBand.set(mint, "traded");
+    return opened;
   }
 
   function openPosition({ mint, vSol, vTok, fill, nowMs }) {
@@ -179,6 +224,7 @@ export function createPaperSession(options = {}) {
     }
     if (state.cashFaithful < buyLamports || state.cashImproved < buyLamports) {
       stats.blockedByCash += 1;
+      stats.skippedInsufficientCash += 1;
       return reject("insufficient_virtual_cash", {
         mint,
         fillPct: fill,
@@ -316,7 +362,13 @@ export function createPaperSession(options = {}) {
     };
   }
 
-  function markUnpriceable(position, reason, curveState) {
+  function feeStopHit(position, vSol, vTok) {
+    const quote = quoteSell(vSol, vTok, position.improvedEntry.tokens);
+    const slBps = BigInt(Math.round(cfg.stopLossMultiple * 10000));
+    return quote.proceedsLamports * 10000n <= position.spentLamports * slBps;
+  }
+
+  function markUnpriceable(position, reason, curveState, nowMs) {
     if (position.status !== "unpriceable") {
       const missedEarlyExit = cfg.preGraduationExit;
       position.status = "unpriceable";
@@ -332,6 +384,8 @@ export function createPaperSession(options = {}) {
       };
       stats.unpriceable += 1;
       if (missedEarlyExit) stats.missedEarlyExits += 1;
+      if (cfg.strategy === "mid-curve-50-90") stats.died += 1;
+      position.closedAtMs = nowMs;
     }
     return {
       observed: true,
@@ -394,7 +448,10 @@ export function createPaperSession(options = {}) {
     active.delete(position.mint);
     closed.push(position);
     stats.curveMarks += 1;
-    if (trigger === "early_exit") stats.earlyExits += 1;
+    if (trigger === "early_exit" || trigger === "target") stats.earlyExits += 1;
+    if (trigger === "target") stats.targetExits += 1;
+    if (trigger === "stop_loss") stats.stopLosses += 1;
+    if (trigger === "timeout") stats.timeouts += 1;
     return {
       observed: true,
       mint: position.mint,
@@ -432,24 +489,24 @@ export function createPaperSession(options = {}) {
       if (cfg.postGraduation === "handoff") return emitHandoff(position, "curve_missing", curveState, nowMs);
       return cfg.postGraduation === "pending-pool"
         ? markPendingPool(position, "curve_missing", curveState)
-        : markUnpriceable(position, "curve_missing", curveState);
+        : markUnpriceable(position, "curve_missing", curveState, nowMs);
     }
     if (curveState.unreadable) {
       if (cfg.postGraduation === "pending-pool" || cfg.postGraduation === "handoff") {
         return { observed: true, mint, reason: "curve_unreadable_open", modelMark: null, modelPnlBooked: false, onChainSell: false, slotLocked: true };
       }
-      return markUnpriceable(position, "curve_unreadable", curveState);
+      return markUnpriceable(position, "curve_unreadable", curveState, nowMs);
     }
     if (curveState.complete === true) {
       if (cfg.postGraduation === "handoff") return emitHandoff(position, "graduated", curveState, nowMs);
       return cfg.postGraduation === "pending-pool"
         ? markPendingPool(position, "graduated", curveState)
-        : markUnpriceable(position, "graduated", curveState);
+        : markUnpriceable(position, "graduated", curveState, nowMs);
     }
     if (curveState.complete !== false) throw new Error("curve state complete must be boolean");
     const vSol = asLamports(curveState.virtualSolReserves, "virtualSolReserves");
     const vTok = asLamports(curveState.virtualTokenReserves, "virtualTokenReserves");
-    if (vSol <= 0n || vTok <= 0n) return markUnpriceable(position, "invalid_reserves", curveState);
+    if (vSol <= 0n || vTok <= 0n) return markUnpriceable(position, "invalid_reserves", curveState, nowMs);
 
     const observedFillPct = virtualSolFillPct(vSol, cfg.virtualSolAtGraduationLamports);
     const multiple = (Number(vSol) / Number(vTok)) / position.spotEntry;
@@ -458,9 +515,11 @@ export function createPaperSession(options = {}) {
     position.lastObservedFillPct = observedFillPct;
     position.lastObservedAtMs = nowMs;
     let trigger = null;
-    if (cfg.preGraduationExit && observedFillPct >= cfg.earlyExitFillPct && observedFillPct < 100) trigger = "early_exit";
-    else if (multiple >= cfg.takeProfitMultiple) trigger = "take_profit";
-    else if (multiple <= cfg.stopLossMultiple) trigger = "stop_loss";
+    const targetName = cfg.strategy === "mid-curve-50-90" ? "target" : "early_exit";
+    if (cfg.preGraduationExit && observedFillPct >= cfg.earlyExitFillPct && observedFillPct < 100) trigger = targetName;
+    else if (cfg.feeAdjustedStop && feeStopHit(position, vSol, vTok)) trigger = "stop_loss";
+    else if (cfg.useTakeProfit && multiple >= cfg.takeProfitMultiple) trigger = "take_profit";
+    else if (!cfg.feeAdjustedStop && multiple <= cfg.stopLossMultiple) trigger = "stop_loss";
     else if (elapsedSec >= cfg.timeoutSec) trigger = "timeout";
     if (!trigger) {
       return {
@@ -606,7 +665,10 @@ export function createPaperSession(options = {}) {
         preGraduationExit: cfg.preGraduationExit,
         postGraduation: cfg.postGraduation,
         entryFillPctMin: cfg.minFillPct,
-        entryFillPctExclusiveMax: cfg.blockEntryAtExit ? cfg.earlyExitFillPct : 100,
+        entryBandMaxPct: cfg.entryBandMaxPct ?? null,
+        entryFillPctExclusiveMax: cfg.strategy === "mid-curve-50-90"
+          ? cfg.entryBandMaxPct
+          : cfg.blockEntryAtExit ? cfg.earlyExitFillPct : 100,
         buySol: cfg.buySol,
         minFillPct: cfg.minFillPct,
         virtualSolAtGraduationLamports: cfg.virtualSolAtGraduationLamports.toString(),

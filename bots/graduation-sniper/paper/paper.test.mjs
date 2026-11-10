@@ -772,6 +772,80 @@ test("jupiter-direct books the first route, waits through a delay, and zeroes a 
   assert.equal(none.report("D").jupiterSells, 0);
 });
 
+test("mid-curve 50-90 wins at the target, stops out, times out, and skips a late coin", () => {
+  const grad = 85_000_000_000n;
+  const at = (pct) => (grad * BigInt(pct)) / 100n;
+  const book = () => createPaperSession({
+    strategy: "mid-curve-50-90",
+    buySol: 0.2,
+    startingVirtualSol: 3,
+    maxPositions: 10,
+  });
+  const curve = (vSol, complete = false) => ({ complete, virtualSolReserves: vSol, virtualTokenReserves: VTOK, slot: 1 });
+
+  const win = book();
+  assert.equal(win.trySignal({ mint: "early", virtualSolReserves: at(40), virtualTokenReserves: VTOK }, 0).reason, "below_fill");
+  const opened = win.trySignal({ mint: "early", virtualSolReserves: at(52), virtualTokenReserves: VTOK }, 1_000);
+  assert.equal(opened.accepted, true);
+  assert.equal(opened.reason, "opened");
+  const target = win.observe("early", curve(at(90)), 20_000);
+  assert.equal(target.reason, "target");
+  assert.equal(target.onChainSell, false);
+  assert.ok(BigInt(target.modelMark.improved.pnl.lamports) > 0n);
+  assert.equal(win.snapshot().stats.targetExits, 1);
+  assert.equal(win.snapshot().stats.died, 0);
+  assertLedgerConserved(win.snapshot());
+
+  const stopped = book();
+  stopped.trySignal({ mint: "down", virtualSolReserves: at(51), virtualTokenReserves: VTOK }, 0);
+  const sl = stopped.observe("down", curve(at(20)), 5_000);
+  assert.equal(sl.reason, "stop_loss");
+  assert.ok(BigInt(sl.modelMark.improved.pnl.lamports) < 0n);
+  assert.equal(stopped.snapshot().stats.stopLosses, 1);
+  const multiple = BigInt(sl.modelMark.improved.lamports) * 10000n / 200_000_000n;
+  assert.ok(multiple <= 7000n);
+
+  const timed = book();
+  timed.trySignal({ mint: "slow", virtualSolReserves: at(53), virtualTokenReserves: VTOK }, 0);
+  const held = timed.observe("slow", curve(at(53)), 60_000);
+  assert.equal(held.reason, "hold");
+  const expired = timed.observe("slow", curve(at(60)), 1_800_000);
+  assert.equal(expired.reason, "timeout");
+  assert.equal(expired.modelMark.pricedAt, "observed_reserves");
+  assert.equal(timed.snapshot().stats.timeouts, 1);
+  assert.equal(expired.modelMark.elapsedSec, 1800);
+
+  const late = book();
+  const chased = late.trySignal({ mint: "hot", virtualSolReserves: at(60), virtualTokenReserves: VTOK }, 0);
+  assert.equal(chased.reason, "above_entry_band");
+  assert.equal(chased.accepted, false);
+  assert.equal(late.trySignal({ mint: "hot", virtualSolReserves: at(52), virtualTokenReserves: VTOK }, 2_000).reason, "already_skipped");
+  assert.equal(late.snapshot().stats.opened, 0);
+  assert.equal(late.snapshot().stats.skippedAboveBand, 1);
+
+  const jumped = book();
+  jumped.trySignal({ mint: "gap", virtualSolReserves: at(40), virtualTokenReserves: VTOK }, 0);
+  assert.equal(jumped.trySignal({ mint: "gap", virtualSolReserves: at(70), virtualTokenReserves: VTOK }, 1_000).reason, "above_entry_band");
+  assert.equal(jumped.snapshot().stats.opened, 0);
+
+  const poor = createPaperSession({ strategy: "mid-curve-50-90", buySol: 0.2, startingVirtualSol: 0.3, maxPositions: 10 });
+  assert.equal(poor.trySignal({ mint: "one", virtualSolReserves: at(50), virtualTokenReserves: VTOK }, 0).accepted, true);
+  const skipped = poor.trySignal({ mint: "two", virtualSolReserves: at(51), virtualTokenReserves: VTOK }, 31_000);
+  assert.equal(skipped.reason, "insufficient_virtual_cash");
+  assert.equal(poor.snapshot().stats.skippedInsufficientCash, 1);
+
+  const dead = book();
+  dead.trySignal({ mint: "gone", virtualSolReserves: at(50), virtualTokenReserves: VTOK }, 0);
+  const died = dead.observe("gone", { complete: true, slot: 4, virtualSolReserves: at(96), virtualTokenReserves: VTOK }, 8_000);
+  assert.equal(died.reason, "unpriceable");
+  assert.equal(died.modelMark, null);
+  assert.equal(dead.snapshot().stats.died, 1);
+  assert.equal(dead.snapshot().stats.targetExits, 0);
+  assert.equal(dead.snapshot().startingBalance.sol, "3.000000000");
+  assert.equal(dead.snapshot().strategy.buySol, 0.2);
+  assert.equal(dead.snapshot().strategy.maxPositions, 10);
+});
+
 function quoteView(userQuoteLamports, slot) {
   return {
     status: "executable",
