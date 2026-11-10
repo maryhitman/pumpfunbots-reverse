@@ -779,7 +779,6 @@ test("mid-curve 50-90 wins at the target, stops out, times out, and skips a late
     strategy: "mid-curve-50-90",
     buySol: 0.2,
     startingVirtualSol: 3,
-    maxPositions: 10,
   });
   const curve = (vSol, complete = false) => ({ complete, virtualSolReserves: vSol, virtualTokenReserves: VTOK, slot: 1 });
 
@@ -809,11 +808,25 @@ test("mid-curve 50-90 wins at the target, stops out, times out, and skips a late
   timed.trySignal({ mint: "slow", virtualSolReserves: at(53), virtualTokenReserves: VTOK }, 0);
   const held = timed.observe("slow", curve(at(53)), 60_000);
   assert.equal(held.reason, "hold");
-  const expired = timed.observe("slow", curve(at(60)), 1_800_000);
-  assert.equal(expired.reason, "timeout");
-  assert.equal(expired.modelMark.pricedAt, "observed_reserves");
-  assert.equal(timed.snapshot().stats.timeouts, 1);
-  assert.equal(expired.modelMark.elapsedSec, 1800);
+  const stale = timed.observe("slow", curve(at(54)), 5 * 3_600_000);
+  assert.equal(stale.reason, "stale-5h");
+  assert.equal(stale.modelMark.pricedAt, "observed_reserves");
+  assert.equal(timed.snapshot().stats.staleExits, 1);
+
+  const capped = book();
+  capped.trySignal({ mint: "mover", virtualSolReserves: at(50), virtualTokenReserves: VTOK }, 0);
+  assert.equal(capped.observe("mover", curve(at(70)), 3_600_000).reason, "hold");
+  const cap = capped.observe("mover", curve(at(72)), 6 * 3_600_000);
+  assert.equal(cap.reason, "cap-6h");
+  assert.equal(capped.snapshot().stats.capExits, 1);
+
+  const many = book();
+  for (let i = 0; i < 11; i += 1) {
+    const openedMany = many.trySignal({ mint: `m${i}`, virtualSolReserves: at(50 + (i % 5)), virtualTokenReserves: VTOK }, 0);
+    assert.equal(openedMany.accepted, true, openedMany.reason);
+  }
+  assert.equal(many.snapshot().stats.maxConcurrent, 11);
+  assert.equal(many.trySignal({ mint: "m0", virtualSolReserves: at(52), virtualTokenReserves: VTOK }, 60_000).reason, "already_traded");
 
   const late = book();
   const chased = late.trySignal({ mint: "hot", virtualSolReserves: at(60), virtualTokenReserves: VTOK }, 0);
@@ -837,13 +850,21 @@ test("mid-curve 50-90 wins at the target, stops out, times out, and skips a late
   const dead = book();
   dead.trySignal({ mint: "gone", virtualSolReserves: at(50), virtualTokenReserves: VTOK }, 0);
   const died = dead.observe("gone", { complete: true, slot: 4, virtualSolReserves: at(96), virtualTokenReserves: VTOK }, 8_000);
-  assert.equal(died.reason, "unpriceable");
-  assert.equal(died.modelMark, null);
-  assert.equal(dead.snapshot().stats.died, 1);
+  assert.equal(died.reason, "stuck");
+  assert.equal(died.modelMark.trigger, "stuck");
+  assert.equal(died.modelMark.improved.pnl.sol, "-0.200000000");
+  assert.equal(dead.snapshot().stats.stuckExits, 1);
+  const stillOpen = book();
+  stillOpen.trySignal({ mint: "end", virtualSolReserves: at(52), virtualTokenReserves: VTOK }, 0);
+  stillOpen.observe("end", curve(at(52)), 1_000);
+  const ended = stillOpen.settleOpen(2_000);
+  assert.equal(ended.length, 1);
+  assert.equal(ended[0].reason, "session_end");
+  assert.equal(stillOpen.snapshot().stats.sessionEnds, 1);
   assert.equal(dead.snapshot().stats.targetExits, 0);
   assert.equal(dead.snapshot().startingBalance.sol, "3.000000000");
   assert.equal(dead.snapshot().strategy.buySol, 0.2);
-  assert.equal(dead.snapshot().strategy.maxPositions, 10);
+  assert.equal(dead.snapshot().strategy.maxPositions, null);
 });
 
 function quoteView(userQuoteLamports, slot) {

@@ -34,8 +34,9 @@ function bannerLines(review, decision) {
   ];
   if (decision.midCompare) {
     lines.push("MID COMPARE: E mid-curve 50->90, A exit-at-97, B relay PumpSwap immediate with a Jupiter quote fallback. Each book starts at 3 virtual SOL and bets 0.2 SOL.");
-    lines.push("E buys the first time fill is inside 50-55% and does not chase a coin first seen above 55%. It sells on the curve at the first complete=false read at or above 90%, at a 0.7x fee-adjusted stop, or at the 30 minute mark using the current curve quote.");
-    lines.push("E allows 10 positions, which is 2 SOL of open cost. A and B keep 3 positions. A new 0.2 SOL entry is skipped, and counted, when the book has less than 0.2 SOL free.");
+    lines.push("E buys every first read inside 50-55% while free cash is at least 0.2 SOL. There is no position cap and no global cooldown. The same mint is not bought again.");
+    lines.push("E sells on the curve at the first complete=false read at or above 90%, at a 0.7x fee-adjusted stop, when a rolling 5 hour window has less than 2 fill points of movement and value within 10% of entry, or at a 6 hour hard cap. A missing or completed curve is stuck at zero.");
+    lines.push("A and B keep 3 positions. A new 0.2 SOL entry is skipped, and counted, when the book has less than 0.2 SOL free. Open E positions at the end are marked on the last curve read and reported separately.");
     lines.push("No key is loaded. Jupiter, if B needs a quote, is GET /swap/v1/quote only.");
   } else if (decision.directCompare) {
     lines.push("DIRECT COMPARE: A exit-at-97, B PumpSwap-direct immediate, D Jupiter-direct immediate. Each starts at 10 virtual SOL.");
@@ -114,7 +115,7 @@ function bookOutcome(snapshot, extraCloses = []) {
   const cash = BigInt(snapshot.ledgers.improved.cash.lamports);
   const reserved = BigInt(snapshot.ledgers.improved.reservedOpen.lamports);
   const rows = [];
-  const reasons = { target: 0, stop_loss: 0, timeout: 0, take_profit: 0, graduation: 0, other: 0 };
+  const reasons = { target: 0, stop_loss: 0, timeout: 0, take_profit: 0, graduation: 0, stale: 0, cap: 0, stuck: 0, sessionEnd: 0, other: 0 };
   let holdMs = 0;
   let holdN = 0;
   let wins = 0;
@@ -125,6 +126,10 @@ function bookOutcome(snapshot, extraCloses = []) {
     else if (trigger === "stop_loss") reasons.stop_loss += 1;
     else if (trigger === "timeout") reasons.timeout += 1;
     else if (trigger === "take_profit") reasons.take_profit += 1;
+    else if (trigger === "stale-5h") reasons.stale += 1;
+    else if (trigger === "cap-6h") reasons.cap += 1;
+    else if (trigger === "stuck") reasons.stuck += 1;
+    else if (trigger === "session_end") reasons.sessionEnd += 1;
     else reasons.other += 1;
     rows.push(pnl);
     if (pnl > 0n) wins += 1;
@@ -160,6 +165,7 @@ function bookOutcome(snapshot, extraCloses = []) {
     died,
     skippedInsufficientCash: snapshot.stats.skippedInsufficientCash ?? 0,
     skippedAboveBand: snapshot.stats.skippedAboveBand ?? 0,
+    maxConcurrent: snapshot.stats.maxConcurrent ?? 0,
     pnlSol: lamportsToSolString(pnl),
     pnlExcludingBiggestSol: lamportsToSolString(pnl - biggest),
     returnPct: percentOnStart(pnl, start),
@@ -294,7 +300,7 @@ async function main() {
       maxPositions: 3,
     }));
     sessions = [
-      createPaperSession({ strategy: "mid-curve-50-90", ...compareSize, maxPositions: 10 }),
+      createPaperSession({ strategy: "mid-curve-50-90", ...compareSize }),
       createPaperSession({ strategy: "exit-at-97", earlyExitFillPct: decision.earlyExitFillPct, ...compareSize, maxPositions: 3 }),
       relayAdapter(relayBooks[0], "relay-immediate"),
     ];
@@ -404,6 +410,10 @@ async function main() {
       book.settle(Date.now());
     }
   }
+  if (decision.midCompare && typeof sessions[0].settleOpen === "function") {
+    const marked = sessions[0].settleOpen(Date.now());
+    log(`[PAPER] E session-end marks=${marked.length} on the last curve read. These are separate from stale-5h and cap-6h exits.`);
+  }
   const books = sessions.map((session) => session.snapshot());
     const relayReports = decision.midCompare
     ? [null, null, relayBooks[0].report("B-relay-immediate")]
@@ -431,7 +441,7 @@ async function main() {
     midOutcomes = books.map((snapshot, index) => bookOutcome(snapshot, index === 2 ? sellerCloses : []));
     const labels = ["E", "A", "B"];
     midOutcomes.forEach((outcome, index) => {
-      log(`[PAPER] ${labels[index]} ${outcome.name} opens=${outcome.opens} target=${outcome.reasons.target} sl=${outcome.reasons.stop_loss} timeout=${outcome.reasons.timeout} tp=${outcome.reasons.take_profit} graduationSells=${outcome.reasons.graduation} died=${outcome.died} open=${outcome.stillOpen} skipped: insufficient paper cash=${outcome.skippedInsufficientCash} skippedAbove55=${outcome.skippedAboveBand} pnl=${outcome.pnlSol} pnlExBiggest=${outcome.pnlExcludingBiggestSol} returnOn3Sol=${outcome.returnPct} winRate=${outcome.winRate} avgHoldSec=${outcome.avgHoldSec} endCash=${outcome.cashSol} reserved=${outcome.reservedSol} endingBalance=${outcome.equitySol}`);
+      log(`[PAPER] ${labels[index]} ${outcome.name} opens=${outcome.opens} target=${outcome.reasons.target} sl=${outcome.reasons.stop_loss} stale-5h=${outcome.reasons.stale} cap-6h=${outcome.reasons.cap} stuck=${outcome.reasons.stuck} sessionEnd=${outcome.reasons.sessionEnd} timeout=${outcome.reasons.timeout} tp=${outcome.reasons.take_profit} graduationSells=${outcome.reasons.graduation} died=${outcome.died} open=${outcome.stillOpen} maxConcurrent=${outcome.maxConcurrent} skipped: insufficient paper cash=${outcome.skippedInsufficientCash} skippedAbove55=${outcome.skippedAboveBand} pnl=${outcome.pnlSol} pnlExBiggest=${outcome.pnlExcludingBiggestSol} returnOn3Sol=${outcome.returnPct} winRate=${outcome.winRate} avgHoldSec=${outcome.avgHoldSec} endCash=${outcome.cashSol} reserved=${outcome.reservedSol} endingBalance=${outcome.equitySol}`);
     });
     log("[PAPER] Mid-curve comparison is descriptive only. Marks are not landed trades. On-chain sells: 0.");
   } else if (decision.relayCompare) {

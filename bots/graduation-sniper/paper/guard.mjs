@@ -191,7 +191,7 @@ export function evaluateInvocation(argv, env = process.env) {
     earlyExitFillPct = null;
   }
 
-  const durationCap = relayCompare || midCompare ? MAX_RELAY_DURATION_SEC : MAX_PUBLIC_DURATION_SEC;
+  const durationCap = midCompare ? 28_800 : relayCompare ? MAX_RELAY_DURATION_SEC : MAX_PUBLIC_DURATION_SEC;
   if ((publicRead || durationPassed) && (!Number.isInteger(durationSec) || durationSec < 1 || durationSec > durationCap)) {
     return refuse(
       `--duration-sec must be an integer from 1 to ${durationCap}. This entrypoint will not run as a daemon.`,

@@ -39,8 +39,10 @@ function requireConfig(options) {
     if (!Object.prototype.hasOwnProperty.call(options, "minFillPct")) cfg.minFillPct = 50;
     if (!Object.prototype.hasOwnProperty.call(options, "entryBandMaxPct")) cfg.entryBandMaxPct = 55;
     if (!Object.prototype.hasOwnProperty.call(options, "earlyExitFillPct")) cfg.earlyExitFillPct = 90;
-    if (!Object.prototype.hasOwnProperty.call(options, "maxPositions")) cfg.maxPositions = 10;
-    if (!Object.prototype.hasOwnProperty.call(options, "timeoutSec")) cfg.timeoutSec = 1800;
+    cfg.maxPositions = null;
+    if (!Object.prototype.hasOwnProperty.call(options, "timeoutSec")) cfg.timeoutSec = 6 * 3600;
+    cfg.uncapped = true;
+    cfg.perMintCooldown = true;
     cfg.feeAdjustedStop = true;
     cfg.useTakeProfit = false;
   }
@@ -57,7 +59,7 @@ function requireConfig(options) {
   if (cfg.stopLossMultiple <= 0 || cfg.takeProfitMultiple <= cfg.stopLossMultiple) {
     throw new Error("take-profit must be above stop-loss and stop-loss must be positive");
   }
-  if (!Number.isInteger(cfg.maxPositions) || cfg.maxPositions < 1) throw new Error("maxPositions must be >= 1");
+  if (!cfg.uncapped && (!Number.isInteger(cfg.maxPositions) || cfg.maxPositions < 1)) throw new Error("maxPositions must be >= 1");
   if (!Number.isFinite(cfg.cooldownSec) || cfg.cooldownSec < 0) throw new Error("cooldownSec must be >= 0");
   if (!Number.isFinite(cfg.timeoutSec) || cfg.timeoutSec < 0) throw new Error("timeoutSec must be >= 0");
   if (typeof cfg.virtualSolAtGraduationLamports !== "bigint" || cfg.virtualSolAtGraduationLamports <= 0n) {
@@ -134,6 +136,11 @@ export function createPaperSession(options = {}) {
     died: 0,
     skippedInsufficientCash: 0,
     skippedAboveBand: 0,
+    maxConcurrent: 0,
+    staleExits: 0,
+    capExits: 0,
+    stuckExits: 0,
+    sessionEnds: 0,
   };
   const seenBand = new Map();
 
@@ -205,13 +212,13 @@ export function createPaperSession(options = {}) {
   }
 
   function openPosition({ mint, vSol, vTok, fill, nowMs }) {
-    if (active.size >= cfg.maxPositions) {
+    if (!cfg.uncapped && active.size >= cfg.maxPositions) {
       return reject("max_positions", { mint, fillPct: fill, originalWouldOpen: false, slotLocked: true });
     }
     if (active.has(mint)) {
       return reject("duplicate_mint", { mint, fillPct: fill, originalWouldOpen: false });
     }
-    if (state.lastBuyAtMs !== null && nowMs - state.lastBuyAtMs < cfg.cooldownSec * 1000) {
+    if (!cfg.perMintCooldown && state.lastBuyAtMs !== null && nowMs - state.lastBuyAtMs < cfg.cooldownSec * 1000) {
       return reject("cooldown", {
         mint,
         fillPct: fill,
@@ -252,9 +259,11 @@ export function createPaperSession(options = {}) {
       counterfactual: true,
       onChainFill: false,
       modelMark: null,
+      trail: cfg.strategy === "mid-curve-50-90" ? [{ atMs: nowMs, fill, multipleBps: 10000n }] : undefined,
     };
     active.set(mint, position);
     stats.opened += 1;
+    if (active.size > stats.maxConcurrent) stats.maxConcurrent = active.size;
     const entry = {
       accepted: true,
       reason: "opened",
@@ -362,10 +371,90 @@ export function createPaperSession(options = {}) {
     };
   }
 
-  function feeStopHit(position, vSol, vTok) {
+  function feeMultipleBps(position, vSol, vTok) {
     const quote = quoteSell(vSol, vTok, position.improvedEntry.tokens);
+    if (position.spentLamports <= 0n) return 0n;
+    return (quote.proceedsLamports * 10000n) / position.spentLamports;
+  }
+
+  function feeStopHit(position, vSol, vTok) {
     const slBps = BigInt(Math.round(cfg.stopLossMultiple * 10000));
-    return quote.proceedsLamports * 10000n <= position.spentLamports * slBps;
+    return feeMultipleBps(position, vSol, vTok) <= slBps;
+  }
+
+  function noteTrail(position, nowMs, fill, multipleBps) {
+    const trail = position.trail ?? (position.trail = []);
+    const last = trail[trail.length - 1];
+    if (!last || nowMs - last.atMs >= 60_000) trail.push({ atMs: nowMs, fill, multipleBps });
+    else {
+      last.atMs = nowMs;
+      last.fill = fill;
+      last.multipleBps = multipleBps;
+    }
+    const keepAfter = nowMs - (6 * 3600 * 1000);
+    while (trail.length > 2 && trail[1].atMs < keepAfter) trail.shift();
+  }
+
+  function staleWindow(position, nowMs, fill, multipleBps) {
+    const windowMs = 5 * 3600 * 1000;
+    if (nowMs - position.openedAtMs < windowMs) return false;
+    const start = nowMs - windowMs;
+    const trail = position.trail ?? [];
+    const prior = [...trail].reverse().find((point) => point.atMs <= start);
+    const inside = trail.filter((point) => point.atMs >= start);
+    const points = [...(prior ? [prior] : []), ...inside, { atMs: nowMs, fill, multipleBps }];
+    if (points.length === 0 || nowMs - points[0].atMs < windowMs) return false;
+    const fills = points.map((point) => point.fill);
+    if (Math.max(...fills) - Math.min(...fills) >= 2) return false;
+    return points.every((point) => point.multipleBps >= 9000n && point.multipleBps <= 11000n);
+  }
+
+  function closeStuck(position, nowMs) {
+    const zero = 0n;
+    const loss = -position.spentLamports;
+    const mark = {
+      kind: "simulated_curve_mark",
+      counterfactual: true,
+      onChainSell: false,
+      successfulSell: false,
+      trigger: "stuck",
+      atMs: nowMs,
+      elapsedSec: (nowMs - position.openedAtMs) / 1000,
+      pricedAt: "stuck_zero",
+      backfilledToThreshold: false,
+      faithful: {
+        ...solFields(zero),
+        pnl: solFields(loss),
+        model: "stuck_zero_no_curve",
+        optimistic: false,
+      },
+      improved: {
+        ...solFields(zero),
+        pnl: solFields(loss),
+        model: "stuck_zero_no_curve",
+        optimistic: false,
+      },
+    };
+    position.status = "closed";
+    position.slotLocked = false;
+    position.modelMark = mark;
+    position.closedAtMs = nowMs;
+    state.faithfulModelPnl += loss;
+    state.improvedModelPnl += loss;
+    active.delete(position.mint);
+    closed.push(position);
+    stats.curveMarks += 1;
+    stats.died += 1;
+    stats.stuckExits += 1;
+    return {
+      observed: true,
+      mint: position.mint,
+      reason: "stuck",
+      modelMark: mark,
+      onChainSell: false,
+      successfulSell: false,
+      slotLocked: false,
+    };
   }
 
   function markUnpriceable(position, reason, curveState, nowMs) {
@@ -452,6 +541,9 @@ export function createPaperSession(options = {}) {
     if (trigger === "target") stats.targetExits += 1;
     if (trigger === "stop_loss") stats.stopLosses += 1;
     if (trigger === "timeout") stats.timeouts += 1;
+    if (trigger === "stale-5h") stats.staleExits += 1;
+    if (trigger === "cap-6h") stats.capExits += 1;
+    if (trigger === "session_end") stats.sessionEnds += 1;
     return {
       observed: true,
       mint: position.mint,
@@ -487,6 +579,7 @@ export function createPaperSession(options = {}) {
     }
     if (curveState == null || curveState.missing === true) {
       if (cfg.postGraduation === "handoff") return emitHandoff(position, "curve_missing", curveState, nowMs);
+      if (cfg.strategy === "mid-curve-50-90") return closeStuck(position, nowMs);
       return cfg.postGraduation === "pending-pool"
         ? markPendingPool(position, "curve_missing", curveState)
         : markUnpriceable(position, "curve_missing", curveState, nowMs);
@@ -499,6 +592,7 @@ export function createPaperSession(options = {}) {
     }
     if (curveState.complete === true) {
       if (cfg.postGraduation === "handoff") return emitHandoff(position, "graduated", curveState, nowMs);
+      if (cfg.strategy === "mid-curve-50-90") return closeStuck(position, nowMs);
       return cfg.postGraduation === "pending-pool"
         ? markPendingPool(position, "graduated", curveState)
         : markUnpriceable(position, "graduated", curveState, nowMs);
@@ -514,13 +608,19 @@ export function createPaperSession(options = {}) {
     position.lastSpotMultiple = multiple;
     position.lastObservedFillPct = observedFillPct;
     position.lastObservedAtMs = nowMs;
+    position.lastVSol = vSol;
+    position.lastVTok = vTok;
+    const multipleBps = cfg.strategy === "mid-curve-50-90" ? feeMultipleBps(position, vSol, vTok) : 0n;
+    if (cfg.strategy === "mid-curve-50-90") noteTrail(position, nowMs, observedFillPct, multipleBps);
     let trigger = null;
     const targetName = cfg.strategy === "mid-curve-50-90" ? "target" : "early_exit";
     if (cfg.preGraduationExit && observedFillPct >= cfg.earlyExitFillPct && observedFillPct < 100) trigger = targetName;
     else if (cfg.feeAdjustedStop && feeStopHit(position, vSol, vTok)) trigger = "stop_loss";
     else if (cfg.useTakeProfit && multiple >= cfg.takeProfitMultiple) trigger = "take_profit";
     else if (!cfg.feeAdjustedStop && multiple <= cfg.stopLossMultiple) trigger = "stop_loss";
-    else if (elapsedSec >= cfg.timeoutSec) trigger = "timeout";
+    else if (cfg.strategy === "mid-curve-50-90" && elapsedSec >= 6 * 3600) trigger = "cap-6h";
+    else if (cfg.strategy === "mid-curve-50-90" && staleWindow(position, nowMs, observedFillPct, multipleBps)) trigger = "stale-5h";
+    else if (cfg.strategy !== "mid-curve-50-90" && elapsedSec >= cfg.timeoutSec) trigger = "timeout";
     if (!trigger) {
       return {
         observed: true,
@@ -722,6 +822,26 @@ export function createPaperSession(options = {}) {
     observe,
     snapshot,
     observePool,
+    settleOpen(nowMs) {
+      const results = [];
+      for (const position of [...active.values()]) {
+        if (position.status !== "open" || position.lastVSol == null || position.lastVTok == null) continue;
+        const vSol = position.lastVSol;
+        const vTok = position.lastVTok;
+        const observedFillPct = virtualSolFillPct(vSol, cfg.virtualSolAtGraduationLamports);
+        const markMultiple = (Number(vSol) / Number(vTok)) / position.spotEntry;
+        results.push(applyCurveMark(position, {
+          vSol,
+          vTok,
+          multiple: markMultiple,
+          observedFillPct,
+          trigger: "session_end",
+          nowMs,
+          elapsedSec: (nowMs - position.openedAtMs) / 1000,
+        }));
+      }
+      return results;
+    },
     activeOpenMints() {
       return [...active.values()].filter((p) => p.status === "open").map((p) => p.mint);
     },
