@@ -111,7 +111,7 @@ async function main() {
   log(`[V1] start KST ${kst(started)} durationSec=${duration}`);
   log("[V1] Momentum, liquidity, and the 1h volume window are our rules. Cumulative lifetime fees are unavailable, so the strict book cannot open.");
   fs.writeFileSync(path.join(outDir, "rules.json"), `${JSON.stringify(RULE_MAP, null, 2)}\n`);
-  fs.writeFileSync(path.join(outDir, "config.json"), `${JSON.stringify(V1, null, 2)}\n`);
+  fs.writeFileSync(path.join(outDir, "config.json"), `${JSON.stringify(V1, (_, value) => (typeof value === "bigint" ? value.toString() : value), 2)}\n`);
 
   const book = createVideoBook();
   const candles = createCandleBook();
