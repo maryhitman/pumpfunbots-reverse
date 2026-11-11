@@ -109,3 +109,12 @@ test("the two invalidated v2 quotes stay open instead of stopping", () => {
   assert.equal(book.snapshot().closed, 0);
   assert.equal(book.snapshot().open, 2);
 });
+
+test("carried cash does not move the 2.1 SOL pause or the 0.2 nominal", () => {
+  const carried = 3_099_570_464n;
+  const book = createVideoBook({ requireLifetimeFees: false, startingLamports: carried });
+  assert.equal(book.snapshot().cash, "3.099570464");
+  assert.equal(book.grossDebit > 200_000_000n, true);
+  assert.equal(V2.pauseEquitySol, 2.1);
+  assert.equal(V2.nominalEntrySol, 0.2);
+});

@@ -50,10 +50,10 @@ export function entryPremiumReached(debitLamports, tokens, triggerSolPerUi) {
   return debitLamports * 1_000_000n > tokens * maxLamportsPerUi;
 }
 
-export function createVideoBook({ requireLifetimeFees = true } = {}) {
+export function createVideoBook({ requireLifetimeFees = true, startingLamports = 3n * SOL } = {}) {
   const gross = grossDebitForNominal();
   const nominal = nominalEntryLamports();
-  let cash = 3n * SOL;
+  let cash = startingLamports;
   let pause = false;
   const positions = new Map();
   const closed = [];

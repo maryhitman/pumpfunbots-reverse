@@ -18,6 +18,7 @@ import { RULE_MAP } from "./rules.mjs";
 const HTTP_OK = new Set(READ_ONLY_HTTP_METHODS);
 const WS_OK = new Set(READ_ONLY_WS_METHODS);
 const MAX_RUN_SEC = 7200;
+const HARD_DEADLINE_MS = Date.parse("2026-11-11T23:00:00Z");
 const GRADUATION = 85_000_000_000n;
 
 function kst(ms) {
@@ -71,19 +72,30 @@ function marketCapUsd(vSol, vTok, supply, usd) {
 function parseArgs(argv) {
   let duration = 7200;
   let outDir = path.resolve("paper-runs/video-filter-adapted-v2-no-lifetime-fees");
+  let untilMs = null;
+  let startingLamports = null;
   for (let i = 2; i < argv.length; i += 1) {
     if (argv[i] === "--duration-sec") duration = Number(argv[++i]);
     else if (argv[i] === "--out-dir") outDir = path.resolve(argv[++i]);
+    else if (argv[i] === "--until-iso") untilMs = Date.parse(argv[++i]);
+    else if (argv[i] === "--starting-cash-lamports") startingLamports = BigInt(argv[++i]);
     else throw new Error(`unknown argument ${argv[i]}`);
   }
-  if (!Number.isInteger(duration) || duration < 1 || duration > MAX_RUN_SEC) {
+  if (untilMs != null) {
+    if (!Number.isFinite(untilMs)) throw new Error("--until-iso is not a time");
+    if (untilMs > HARD_DEADLINE_MS) throw new Error("--until-iso is past 2026-11-12 08:00 KST");
+    const remain = Math.floor((untilMs - Date.now()) / 1000);
+    if (remain < 1) throw new Error("deadline is already past");
+    duration = remain;
+  } else if (!Number.isInteger(duration) || duration < 1 || duration > MAX_RUN_SEC) {
     throw new Error(`--duration-sec must be 1 to ${MAX_RUN_SEC}`);
   }
-  return { duration, outDir };
+  return { duration, outDir, untilMs, startingLamports };
 }
 
 async function main() {
-  const { duration, outDir } = parseArgs(process.argv);
+  const { duration, outDir, untilMs, startingLamports } = parseArgs(process.argv);
+  const deadline = untilMs ?? (Date.now() + duration * 1000);
   fs.mkdirSync(outDir, { recursive: true });
   const started = Date.now();
   const lines = [];
@@ -92,11 +104,15 @@ async function main() {
     console.log(line);
   };
   log(`[V2] ${V2.id} paper-only. Lifetime fees do not veto. This is not the video filter and not a rematch of v1.`);
-  log(`[V2] start KST ${kst(started)} durationSec=${duration}`);
+  log(`[V2] start KST ${kst(started)} deadline KST ${kst(deadline)} carriedCashLamports=${startingLamports ?? 3_000_000_000n}`);
+  log("[V2] Pause stays at 2.1 SOL against the original 3 SOL reference. Carried cash is not a new deposit.");
   fs.writeFileSync(path.join(outDir, "rules.json"), `${JSON.stringify(RULE_MAP, null, 2)}\n`);
   fs.writeFileSync(path.join(outDir, "config.json"), `${JSON.stringify(V2, (_, value) => (typeof value === "bigint" ? value.toString() : value), 2)}\n`);
 
-  const book = createVideoBook({ requireLifetimeFees: false });
+  const book = createVideoBook({
+    requireLifetimeFees: false,
+    ...(startingLamports == null ? {} : { startingLamports }),
+  });
   const candles = createCandleBook();
   const endpoint = PUBLIC_ENDPOINTS[0];
   let price = await solUsd(log);
@@ -118,11 +134,12 @@ async function main() {
   const armed = new Map();
   const lastTrade = new Map();
   const fills = [];
+  const feed = { upMs: 0, downMs: 0, connectedAt: null, disconnectedAt: null, candleGaps: 0 };
 
-  async function readCurve(mint) {
+  async function readCurve(mint, force = false) {
     const cached = curveCache.get(mint);
     const now = Date.now();
-    if (cached && now - cached.atMs < 30_000) return cached;
+    if (!force && cached && now - cached.atMs < 30_000) return cached;
     const result = await rpc(endpoint.http, "getAccountInfo", [
       bondingCurveAddress(mint),
       { encoding: "base64", commitment: "confirmed" },
@@ -141,7 +158,9 @@ async function main() {
     return row;
   }
 
+  let acceptingEntries = true;
   function tryExecute(mint, nowMs) {
+    if (!acceptingEntries || nowMs >= deadline) return;
     const signal = armed.get(mint);
     const trade = lastTrade.get(mint);
     const curve = curveCache.get(mint);
@@ -230,12 +249,13 @@ async function main() {
     lastTrade.set(event.mint, { atMs: nowMs, vSol, vTok });
     if (price?.usd && event.tokenAmount > 0 && event.solAmount > 0) {
       const before = candles.closed(event.mint).length;
-      candles.ingest({
+      const ingested = candles.ingest({
         mint: event.mint,
         atMs: nowMs,
         price: event.solAmount / event.tokenAmount,
         volumeUsd: event.solAmount * price.usd,
       });
+      if (ingested.gap) feed.candleGaps += 1;
       candles.roll(event.mint, nowMs);
       if (candles.closed(event.mint).length > before) {
         const signal = momentumSignal(candles.closed(event.mint));
@@ -285,9 +305,13 @@ async function main() {
     };
     let reconnects = 0;
     const connect = () => {
-      if (Date.now() >= started + duration * 1000) return finish();
+      if (Date.now() >= deadline) return finish();
       ws = new WebSocket(endpoint.ws);
       ws.addEventListener("open", () => {
+        const now = Date.now();
+        if (feed.disconnectedAt != null) feed.downMs += now - feed.disconnectedAt;
+        feed.disconnectedAt = null;
+        feed.connectedAt = now;
         wsSend(ws, "logsSubscribe", [{ mentions: [PUMP_PROGRAM.toBase58()] }, { commitment: "confirmed" }], 1);
         log(`[V2] subscribed ${endpoint.name}`);
       });
@@ -300,35 +324,114 @@ async function main() {
         onTrade(event, Date.now());
       });
       ws.addEventListener("close", () => {
-        if (finished || Date.now() >= started + duration * 1000) return finish();
+        const now = Date.now();
+        if (feed.connectedAt != null) {
+          feed.upMs += now - feed.connectedAt;
+          feed.connectedAt = null;
+        }
+        if (finished || now >= deadline) return finish();
         reconnects += 1;
+        feed.disconnectedAt = now;
         gates.evaluations.reconnects = reconnects;
-        log("[V2] socket closed, reconnecting inside the two-hour bound");
+        log("[V2] socket closed, reconnecting before the KST deadline");
         setTimeout(connect, 2000);
       });
     };
     connect();
     const beat = setInterval(() => {
-      if (Date.now() >= started + duration * 1000) return;
+      if (Date.now() >= deadline) return;
       solUsd(log).then((next) => { if (next) price = next; }).catch(() => {});
       const snap = book.snapshot();
       log(`[V2] heartbeat stretch=${gates.stretchSeen.size} confirmed=${gates.curveConfirmed.size} mcap=${gates.mcapPass.size} momentum=${gates.momentumPass.size} entries=${gates.entered.size} open=${snap.open} cash=${snap.cash} pnl=${snap.realizedPnl}`);
+      fs.writeFileSync(path.join(outDir, "checkpoint.json"), `${JSON.stringify({
+        atKst: kst(Date.now()),
+        deadlineKst: kst(deadline),
+        stretch: gates.stretchSeen.size,
+        mcap: gates.mcapPass.size,
+        momentum: gates.momentumPass.size,
+        entries: gates.entered.size,
+        open: snap.open,
+        cash: snap.cash,
+        realizedPnl: snap.realizedPnl,
+        reconnects,
+        feedUpMs: feed.upMs + (feed.connectedAt ? Date.now() - feed.connectedAt : 0),
+      }, null, 2)}\n`);
     }, 60_000);
+    const stopAt = Math.max(0, deadline - Date.now());
     setTimeout(() => {
+      acceptingEntries = false;
       clearInterval(beat);
+      log("[V2] deadline reached. New entries stopped.");
       finish();
-    }, duration * 1000);
+    }, stopAt);
   });
 
+  if (feed.connectedAt != null) {
+    feed.upMs += Date.now() - feed.connectedAt;
+    feed.connectedAt = null;
+  }
+  const endMarks = [];
+  for (const position of book.listOpen()) {
+    try {
+      const curve = await readCurve(position.mint, true);
+      if (!curve || curve.complete || curve.vSol <= 0n || curve.vTok <= 0n) {
+        endMarks.push({
+          mint: position.mint,
+          status: curve?.complete ? "stuck_curve_complete" : "unavailable",
+          strategicExit: false,
+          proceedsLamports: null,
+        });
+        continue;
+      }
+      const sell = quoteSell(curve.vSol, curve.vTok, BigInt(position.remaining));
+      endMarks.push({
+        mint: position.mint,
+        status: "unrealized_executable",
+        strategicExit: false,
+        proceedsLamports: sell.proceedsLamports.toString(),
+        feeLamports: sell.feeLamports.toString(),
+        formula: "repo quoteSell 1%",
+        atMs: Date.now(),
+      });
+    } catch (err) {
+      endMarks.push({ mint: position.mint, status: "unavailable", strategicExit: false, error: err.message });
+    }
+  }
   const ended = Date.now();
   const snap = book.snapshot();
+  const carried = startingLamports ?? 3_000_000_000n;
+  const original = 3_000_000_000n;
+  const parseSol = (text) => {
+    const neg = text.startsWith("-");
+    const [whole, frac = ""] = (neg ? text.slice(1) : text).split(".");
+    const lamports = BigInt(`${whole}${frac.padEnd(9, "0").slice(0, 9)}`);
+    return neg ? -lamports : lamports;
+  };
+  const realized = parseSol(snap.realizedPnl);
+  const freeCash = parseSol(snap.cash);
+  const unrealized = endMarks.reduce((sum, row) => sum + (row.proceedsLamports == null ? 0n : BigInt(row.proceedsLamports)), 0n);
+  const openCost = book.listOpen().reduce((sum, row) => sum + BigInt(row.cost), 0n);
+  const fmt = (lamports) => {
+    const neg = lamports < 0n;
+    const v = neg ? -lamports : lamports;
+    return `${neg ? "-" : ""}${v / 1_000_000_000n}.${(v % 1_000_000_000n).toString().padStart(9, "0")}`;
+  };
   const report = {
     strategy: V2.id,
     paperOnly: true,
     reproducesVideoFeeFilter: false,
     comparedWithV1: false,
-    runLabel: "corrected-rerun",
+    runLabel: untilMs ? "overnight-to-2026-11-12-0800-KST" : "corrected-rerun",
     invalid_for_strategy_evaluation: false,
+    carriedCashLamports: carried.toString(),
+    pauseEquitySol: V2.pauseEquitySol,
+    pauseReference: "absolute 2.1 SOL from the original 3 SOL book, not recomputed from carried cash",
+    incrementalRealizedVersusCarried: fmt(realized),
+    cumulativeValidRealizedVersus3Sol: fmt((carried - original) + realized),
+    unrealizedExecutable: fmt(unrealized),
+    unrealizedVersusOpenCost: fmt(unrealized - openCost),
+    conservativeEquity: fmt(freeCash + unrealized),
+    endMarks,
     onChainSells: 0,
     startedMs: started,
     endedMs: ended,
@@ -348,6 +451,12 @@ async function main() {
       evaluations: gates.evaluations,
     },
     reconnects: gates.evaluations.reconnects ?? 0,
+    feed: {
+      upMs: feed.upMs,
+      downMs: feed.downMs,
+      candleGaps: feed.candleGaps,
+      uptimeNote: "Socket open time versus close gaps inside this process only. The unobserved interval before this process is not filled in.",
+    },
     fills,
     exits: snap.trades,
     quarantined: snap.quarantinedRows,
