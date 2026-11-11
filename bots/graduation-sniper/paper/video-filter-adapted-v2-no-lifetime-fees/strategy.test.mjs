@@ -57,4 +57,21 @@ test("v2 keeps every gate except the lifetime-fee veto", () => {
 
   const v1 = createVideoBook();
   assert.equal(v1.screen(candidate()).reason, "cumulative_fees_unavailable");
+
+  const sized = createVideoBook({ requireLifetimeFees: false });
+  const signal = { ok: true, triggerPrice: 1, candleEndMs: 1 };
+  const tokens = 982_312_202_183n;
+  assert.equal(sized.tryEnter({
+    mint: "big",
+    signal,
+    quote: { atMs: 2, price: 1, tokens, executableValue: sized.grossDebit },
+    nowMs: 2,
+  }).accepted, true);
+  const held = sized.exitOnQuote({
+    mint: "big",
+    quote: { atMs: 3_000, proceedsForRemaining: sized.grossDebit + 20_000_000n },
+    nowMs: 3_000,
+  });
+  assert.equal(held.reason, "hold");
+  assert.equal(sized.snapshot().closed, 0);
 });

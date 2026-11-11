@@ -122,12 +122,12 @@ export function createVideoBook({ requireLifetimeFees = true } = {}) {
     if (typeof quote?.proceedsForRemaining !== "bigint" || quote.atMs == null) return { acted: false, reason: "no_executable" };
     const value = quote.proceedsForRemaining;
     const previousHigh = position.highValue;
-    const perToken = value / position.remaining;
-    const entryPer = position.cost / (position.tokens > 0n ? position.tokens : 1n);
     const held = nowMs - position.openedAtMs;
     let reason = null;
     let sellTokens = position.remaining;
-    if (perToken * 10000n <= entryPer * 8500n) reason = "stop";
+    // Compare with cross-multiplication. Dividing lamports by a raw token count truncates to zero.
+    const belowStop = value * position.tokens * 10000n <= position.cost * position.remaining * 8500n;
+    if (belowStop) reason = "stop";
     else if (!position.tookProfit && value * 10000n >= position.costRemaining * 13000n) {
       reason = "take_profit";
       sellTokens = position.remaining / 2n;
@@ -135,8 +135,10 @@ export function createVideoBook({ requireLifetimeFees = true } = {}) {
     } else if (position.tookProfit && value * 10000n <= previousHigh * 9000n) reason = "trail";
     else if (held >= V1.maxHoldMs) reason = "cap-6h";
     else if (held >= V1.staleHoldMs) {
-      const move = perToken > entryPer ? perToken - entryPer : entryPer - perToken;
-      if (move * 10000n <= entryPer * 1000n) reason = "stale-5h";
+      const gap = value * position.tokens > position.cost * position.remaining
+        ? value * position.tokens - position.cost * position.remaining
+        : position.cost * position.remaining - value * position.tokens;
+      if (gap * 10000n <= position.cost * position.remaining * 1000n) reason = "stale-5h";
     }
     if (value > position.highValue) position.highValue = value;
     if (!reason) return { acted: false, reason: "hold", value: value.toString() };
