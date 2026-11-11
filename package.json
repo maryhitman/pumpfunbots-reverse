@@ -8,7 +8,9 @@
     "monitor": "node bots/monitor/stream.mjs",
     "sniper": "node bots/sniper/sniper.mjs",
     "copy": "node bots/copy-trader/watcher.mjs",
-    "analytics": "node bots/analytics/server.mjs"
+    "analytics": "node bots/analytics/server.mjs",
+    "test:paper": "node --test bots/graduation-sniper/paper/paper.test.mjs",
+    "paper:graduation": "node bots/graduation-sniper/paper/run.mjs"
   },
   "dependencies": {
     "@solana/web3.js": "^1.98.0",

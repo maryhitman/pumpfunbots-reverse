@@ -1,0 +1,90 @@
+{
+  "description": "Deterministic paper scenario: below-band and full-curve signals are ignored, one curve timeout is marked on both ledgers, one graduation and one missing curve stay unpriceable and lock slots, and a later signal is rejected at the position cap.",
+  "events": [
+    {
+      "atMs": 0,
+      "type": "trade",
+      "mint": "below-band",
+      "virtualSolReserves": "77350000000",
+      "virtualTokenReserves": "1000000000000000"
+    },
+    {
+      "atMs": 0,
+      "type": "trade",
+      "mint": "full-curve",
+      "virtualSolReserves": "85000000000",
+      "virtualTokenReserves": "1000000000000000"
+    },
+    {
+      "atMs": 1000,
+      "type": "trade",
+      "mint": "mint-timeout",
+      "virtualSolReserves": "78200000000",
+      "virtualTokenReserves": "1000000000000000"
+    },
+    {
+      "atMs": 4000,
+      "type": "curve",
+      "mint": "mint-timeout",
+      "state": {
+        "complete": false,
+        "virtualSolReserves": "78200000000",
+        "virtualTokenReserves": "1000000000000000"
+      }
+    },
+    {
+      "atMs": 301000,
+      "type": "curve",
+      "mint": "mint-timeout",
+      "state": {
+        "complete": false,
+        "virtualSolReserves": "78200000000",
+        "virtualTokenReserves": "1000000000000000"
+      }
+    },
+    {
+      "atMs": 331000,
+      "type": "trade",
+      "mint": "mint-grad",
+      "virtualSolReserves": "78200000000",
+      "virtualTokenReserves": "1000000000000000"
+    },
+    {
+      "atMs": 334000,
+      "type": "curve",
+      "mint": "mint-grad",
+      "state": {
+        "complete": true,
+        "virtualSolReserves": "200000000000",
+        "virtualTokenReserves": "1000000000000000"
+      }
+    },
+    {
+      "atMs": 361000,
+      "type": "trade",
+      "mint": "mint-missing",
+      "virtualSolReserves": "78200000000",
+      "virtualTokenReserves": "1000000000000000"
+    },
+    {
+      "atMs": 364000,
+      "type": "curve",
+      "mint": "mint-missing",
+      "state": null
+    },
+    {
+      "atMs": 391000,
+      "type": "trade",
+      "mint": "mint-open",
+      "virtualSolReserves": "78200000000",
+      "virtualTokenReserves": "1000000000000000"
+    },
+    {
+      "atMs": 421000,
+      "type": "trade",
+      "mint": "mint-blocked",
+      "virtualSolReserves": "78200000000",
+      "virtualTokenReserves": "1000000000000000"
+    }
+  ]
+}
