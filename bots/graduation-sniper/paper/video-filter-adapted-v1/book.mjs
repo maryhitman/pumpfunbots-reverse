@@ -14,6 +14,42 @@ function bps(numerator, denominator) {
   return (numerator * 10000n) / denominator;
 }
 
+// a/b <= c/d, without dividing. All values are bigint and denominators stay in the product.
+export function ratioAtMost(numerator, denominator, limitNumerator, limitDenominator) {
+  return numerator * limitDenominator <= limitNumerator * denominator;
+}
+
+export function ratioAtLeast(numerator, denominator, limitNumerator, limitDenominator) {
+  return numerator * limitDenominator >= limitNumerator * denominator;
+}
+
+export function stopReached(value, cost, tokens, remaining) {
+  return ratioAtMost(value, remaining, cost * 85n, tokens * 100n);
+}
+
+export function takeProfitReached(value, costRemaining) {
+  return ratioAtLeast(value, 1n, costRemaining * 130n, 100n);
+}
+
+export function trailReached(value, high) {
+  return ratioAtMost(value, 1n, high * 90n, 100n);
+}
+
+export function staleReached(value, cost, tokens, remaining) {
+  const basis = cost * remaining;
+  const marked = value * tokens;
+  const gap = marked > basis ? marked - basis : basis - marked;
+  return ratioAtMost(gap, basis, 10n, 100n);
+}
+
+export function entryPremiumReached(debitLamports, tokens, triggerSolPerUi) {
+  if (typeof tokens !== "bigint" || tokens <= 0n) return true;
+  if (!(triggerSolPerUi > 0)) return true;
+  const maxLamportsPerUi = BigInt(Math.round(triggerSolPerUi * 1e9 * 1.05));
+  if (maxLamportsPerUi <= 0n) return true;
+  return debitLamports * 1_000_000n > tokens * maxLamportsPerUi;
+}
+
 export function createVideoBook({ requireLifetimeFees = true } = {}) {
   const gross = grossDebitForNominal();
   const nominal = nominalEntryLamports();
@@ -81,7 +117,10 @@ export function createVideoBook({ requireLifetimeFees = true } = {}) {
     if (pause) return skip("drawdown_pause", { mint });
     if (!signal?.ok) return skip(signal?.reason ?? "no_signal", { mint });
     if (quote?.atMs == null || quote.atMs < signal.candleEndMs) return skip("quote_before_close", { mint });
-    if (!(quote.price > 0) || quote.price > signal.triggerPrice * (1 + V1.maxEntryPremium)) {
+    if (typeof quote.tokens !== "bigint" || quote.tokens <= 0n) return skip("zero_quantity", { mint });
+    if (quote.decimals === 6) {
+      if (entryPremiumReached(gross, quote.tokens, signal.triggerPrice)) return skip("entry_premium", { mint });
+    } else if (!(quote.price > 0) || quote.price > signal.triggerPrice * (1 + V1.maxEntryPremium)) {
       return skip("entry_premium", { mint });
     }
     if (quote.quarantine) {
@@ -125,20 +164,15 @@ export function createVideoBook({ requireLifetimeFees = true } = {}) {
     const held = nowMs - position.openedAtMs;
     let reason = null;
     let sellTokens = position.remaining;
-    // Compare with cross-multiplication. Dividing lamports by a raw token count truncates to zero.
-    const belowStop = value * position.tokens * 10000n <= position.cost * position.remaining * 8500n;
-    if (belowStop) reason = "stop";
-    else if (!position.tookProfit && value * 10000n >= position.costRemaining * 13000n) {
+    if (stopReached(value, position.cost, position.tokens, position.remaining)) reason = "stop";
+    else if (!position.tookProfit && takeProfitReached(value, position.costRemaining)) {
       reason = "take_profit";
       sellTokens = position.remaining / 2n;
       if (sellTokens <= 0n) sellTokens = position.remaining;
-    } else if (position.tookProfit && value * 10000n <= previousHigh * 9000n) reason = "trail";
+    } else if (position.tookProfit && trailReached(value, previousHigh)) reason = "trail";
     else if (held >= V1.maxHoldMs) reason = "cap-6h";
-    else if (held >= V1.staleHoldMs) {
-      const gap = value * position.tokens > position.cost * position.remaining
-        ? value * position.tokens - position.cost * position.remaining
-        : position.cost * position.remaining - value * position.tokens;
-      if (gap * 10000n <= position.cost * position.remaining * 1000n) reason = "stale-5h";
+    else if (held >= V1.staleHoldMs && staleReached(value, position.cost, position.tokens, position.remaining)) {
+      reason = "stale-5h";
     }
     if (value > position.highValue) position.highValue = value;
     if (!reason) return { acted: false, reason: "hold", value: value.toString() };

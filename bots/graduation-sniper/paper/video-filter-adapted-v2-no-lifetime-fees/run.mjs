@@ -181,6 +181,7 @@ async function main() {
       quote: {
         atMs: trade.atMs,
         price: executionPrice,
+        decimals: 6,
         tokens: buy.tokens,
         executableValue: sell.proceedsLamports,
       },
@@ -326,6 +327,8 @@ async function main() {
     paperOnly: true,
     reproducesVideoFeeFilter: false,
     comparedWithV1: false,
+    runLabel: "corrected-rerun",
+    invalid_for_strategy_evaluation: false,
     onChainSells: 0,
     startedMs: started,
     endedMs: ended,
