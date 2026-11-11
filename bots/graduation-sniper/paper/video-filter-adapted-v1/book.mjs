@@ -14,7 +14,7 @@ function bps(numerator, denominator) {
   return (numerator * 10000n) / denominator;
 }
 
-export function createVideoBook() {
+export function createVideoBook({ requireLifetimeFees = true } = {}) {
   const gross = grossDebitForNominal();
   const nominal = nominalEntryLamports();
   let cash = 3n * SOL;
@@ -64,10 +64,14 @@ export function createVideoBook() {
       return skip("stage", candidate);
     }
     if (candidate.observedAtMs > candidate.asOfMs) return skip("lookahead", candidate);
-    if (candidate.fees?.available !== true || candidate.fees.asOfMs == null || candidate.fees.asOfMs > candidate.asOfMs) {
-      return skip("cumulative_fees_unavailable", candidate);
+    if (requireLifetimeFees) {
+      if (candidate.fees?.available !== true || candidate.fees.asOfMs == null || candidate.fees.asOfMs > candidate.asOfMs) {
+        return skip("cumulative_fees_unavailable", candidate);
+      }
+      if (!(candidate.fees.lifetimeSol >= V1.cumulativeFeesSolMin)) return skip("cumulative_fees_low", candidate);
+    } else if (candidate.fees?.asOfMs != null && candidate.fees.asOfMs > candidate.asOfMs) {
+      return skip("lookahead", candidate);
     }
-    if (!(candidate.fees.lifetimeSol >= V1.cumulativeFeesSolMin)) return skip("cumulative_fees_low", candidate);
     if (!(candidate.marketCapUsd >= V1.marketCapUsdMin)) return skip("market_cap", candidate);
     return { accepted: true, reason: "screen_pass" };
   }
@@ -162,6 +166,31 @@ export function createVideoBook() {
     tryEnter,
     exitOnQuote,
     signal: momentumSignal,
+    markStuck(mint, nowMs) {
+      const position = positions.get(mint);
+      if (!position) return { acted: false, reason: "no_position" };
+      const pnl = position.proceeds - position.cost;
+      positions.delete(mint);
+      closed.push({
+        mint,
+        reason: "stuck",
+        pnl,
+        proceeds: position.proceeds,
+        cost: position.cost,
+        openedAtMs: position.openedAtMs,
+        closedAtMs: nowMs,
+      });
+      noteEquity(equity());
+      return { acted: true, reason: "stuck", pnl: pnl.toString() };
+    },
+    listOpen() {
+      return [...positions.values()].map((position) => ({
+        mint: position.mint,
+        remaining: position.remaining.toString(),
+        cost: position.cost.toString(),
+        openedAtMs: position.openedAtMs,
+      }));
+    },
     snapshot() {
       const marked = equity();
       return {
